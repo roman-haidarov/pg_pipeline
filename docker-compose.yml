@@ -1,0 +1,13 @@
+services:
+  pg14:
+    image: postgres:14
+    environment: { POSTGRES_PASSWORD: postgres }
+    ports: ["5414:5432"]
+  pg16:
+    image: postgres:16
+    environment: { POSTGRES_PASSWORD: postgres }
+    ports: ["5416:5432"]
+  pg17:
+    image: postgres:17
+    environment: { POSTGRES_PASSWORD: postgres }
+    ports: ["5417:5432"]
