@@ -144,16 +144,22 @@ module PgPipeline
       return unless started?(client)
 
       ensure_context!(client)
-      pool(client).graceful_close
-      client.__send__(:started=, false)
+      begin
+        pool(client).graceful_close
+      ensure
+        client.__send__(:started=, false) if pool(client).closing?
+      end
     end
 
     def abort!(client)
       return unless started?(client)
 
       ensure_context!(client)
-      pool(client).abort!
-      client.__send__(:started=, false)
+      begin
+        pool(client).abort!
+      ensure
+        client.__send__(:started=, false) if pool(client).closing?
+      end
     end
 
     def pool(client)

@@ -13,7 +13,7 @@ module PgPipeline
     end
 
     def query(sql, params = []) = SessionOps.query(self, sql, params)
-    def exec(sql) = SessionOps.exec(self, sql)
+    def exec(sql, params = nil) = SessionOps.exec(self, sql, params)
     def prepare(name, sql, param_types = nil) = SessionOps.prepare(self, name, sql, param_types)
     def exec_prepared(name, params = []) = SessionOps.exec_prepared(self, name, params)
     def active? = @active
@@ -39,9 +39,13 @@ module PgPipeline
       connection(session).exec_params(sql, params)
     end
 
-    def exec(session, sql)
+    def exec(session, sql, params = nil)
       ensure_active!(session)
-      connection(session).exec(sql)
+      if params.nil?
+        connection(session).exec(sql)
+      else
+        connection(session).exec_params(sql, params)
+      end
     end
 
     def prepare(session, name, sql, param_types)

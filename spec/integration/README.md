@@ -6,14 +6,16 @@ PostgreSQL server and the `pg` + `async` gems installed.
 ## Run locally
 
 ```
-docker compose up -d pg17          # or pg14 / pg16
-PG_PIPELINE_URL=postgres://postgres:postgres@localhost:5417/postgres \
+docker compose up -d pg18          # or pg14 / pg16 / pg17
+PG_PIPELINE_URL=postgres://postgres:postgres@localhost:5418/postgres \
   bundle exec rspec spec/integration
 ```
 
-Set `PG_PIPELINE_URL` to point at each server in the matrix (14 / 16 / 17+) to
-prove the libpq 14–16 `pipeline_sync` path and the 17+ `send_pipeline_sync`
-path both behave identically.
+Set `PG_PIPELINE_URL` to point at each server in the matrix (14 / 16 / 17 / 18)
+to exercise supported server generations. The Sync implementation path is chosen
+from the linked **client libpq**, not the server; `.github/workflows/ci.yml` has a
+separate source-built client-libpq 14/16/17 matrix that also runs this live suite
+for capability coverage.
 
 ## Covered by `integration_spec.rb`
 
@@ -31,6 +33,5 @@ path both behave identically.
 
 ## Still manual / future
 
-- `benchmarks/multiworker_smoke.rb` — multi-process connection occupancy
-- client **libpq** 14 vs 17 path (CI matrices **server** majors; runner libpq is one)
+- `bench_kit/multiworker_smoke.rb` — multi-process connection occupancy
 - dedicated live health-probe failure (half-open idle) without manual fault injection

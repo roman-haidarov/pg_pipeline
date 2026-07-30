@@ -254,10 +254,10 @@ chunked-rows, non-blocking cancel), never a floor.
 - `SessionGuard` is policy/ergonomics, not a security boundary. `:strict` adds a
   precise denylist (`nextval`/`setval`/`pg_export_snapshot`, …) without the old
   broad `pg_*(` / `set*(` false positives; UDFs can still mutate session state.
-- Live integration covers **server** PG 14/16/17. CI prints the linked **client**
-  libpq version, but does not yet matrix distinct client-libpq majors (one
-  runner libpq across all server jobs). Pipeline capability is client-side, so
-  a dedicated libpq 14/16/17 client matrix remains future work.
+- Live integration covers **server** PG 14/16/17/18. A separate CI matrix
+  builds ruby-pg against source-built **client** libpq 14/16/17, asserts the
+  linked major, and runs both unit and live integration suites because pipeline
+  capability is determined by client libpq rather than server version.
 - On libpq 14–16, `place_sync` uses `PQpipelineSync` / ruby-pg `sync_pipeline_sync`
   (flush coupled); libpq 17+ uses `send_pipeline_sync` + explicit `sync_flush`.
 - Pinned recycle still runs full `DISCARD ALL` (no lighter reset profile / recycle
@@ -284,15 +284,15 @@ Implemented:
   live sibling; the failed Request object itself is never re-used.
 - `abort!` CancelRequest on in-use pinned connections.
 - Falcon per-worker contract + sizing formula; reactor-local Client fail-fast.
-- Packaging: gemspec metadata, CI (unit + PG server 14/16/17), docker-compose,
-  examples, `benchmarks/pipeline_bench.rb` + `benchmarks/multiworker_smoke.rb`.
+- Packaging: gemspec metadata, CI (unit + PG server 14/16/17/18 + client-libpq
+  14/16/17 + exact async floor), docker-compose,
+  examples, `bench_kit/pipeline_throughput.rb` + `bench_kit/multiworker_smoke.rb`.
 - Live integration suite (multiplex, isolation, cancel-drain, savepoints, stats,
   backpressure, pinned concurrency, indeterminate on abort, reconnect, backend
   terminate recovery, pinned abort cancel).
 
 Still open:
 
-- Dedicated client-libpq 14/16/17 CI matrix (not only server majors).
 - Lighter pinned reset / recycle-latency metrics under high-TPS tx.
 - Force socket close if pinned cancel is ignored.
 - Published bench numbers in README; tighten multiworker smoke to peak occupancy.

@@ -305,7 +305,6 @@ RSpec.describe PgPipeline::ConnectionDriver do
     end.wait
   end
 
-
   describe "#load" do
     it "counts the dispatching slot so a driver is not transiently reported idle" do
       driver = described_class.allocate
@@ -318,4 +317,31 @@ RSpec.describe PgPipeline::ConnectionDriver do
     end
   end
 
+  it "stops both watcher tasks even when the first stop raises" do
+    driver = described_class.allocate
+    reader = instance_double(Async::Task)
+    writer = instance_double(Async::Task)
+    driver.instance_variable_set(:@reader_task, reader)
+    driver.instance_variable_set(:@writer_task, writer)
+
+    allow(reader).to receive(:stop).and_raise(RuntimeError, "reader failed")
+    expect(writer).to receive(:stop)
+
+    expect { PgPipeline::DriverOps.stop_watchers(driver) }.not_to raise_error
+    expect(driver.reader_task).to be_nil
+    expect(driver.writer_task).to be_nil
+  end
+
+  it "still stops the second watcher when the first stop raises Async::Cancel" do
+    driver = described_class.allocate
+    reader = instance_double(Async::Task)
+    writer = instance_double(Async::Task)
+    driver.instance_variable_set(:@reader_task, reader)
+    driver.instance_variable_set(:@writer_task, writer)
+
+    allow(reader).to receive(:stop).and_raise(Async::Cancel.new("cancelled"))
+    expect(writer).to receive(:stop)
+
+    expect { PgPipeline::DriverOps.stop_watchers(driver) }.not_to raise_error
+  end
 end

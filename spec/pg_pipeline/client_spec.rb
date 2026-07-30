@@ -89,6 +89,38 @@ RSpec.describe PgPipeline::ClientOps do
     end
   end
 
+  describe "lifecycle cleanup" do
+    def lifecycle_client(pool)
+      PgPipeline::Client.allocate.tap do |client|
+        client.instance_variable_set(:@pool, pool)
+        client.instance_variable_set(:@started, true)
+        client.instance_variable_set(:@owner_thread, Thread.current)
+        client.instance_variable_set(:@scheduler, Fiber.scheduler)
+      end
+    end
+
+    it "marks the client stopped when terminal close cleanup reports an error" do
+      pool = instance_double(PgPipeline::Pool, closing?: true)
+      allow(pool).to receive(:graceful_close).and_raise(RuntimeError, "driver close failed")
+      client = lifecycle_client(pool)
+
+      expect { described_class.close(client) }
+        .to raise_error(RuntimeError, "driver close failed")
+      expect(described_class.started?(client)).to be(false)
+    end
+
+    it "keeps the client started when close is rejected before shutdown begins" do
+      pool = instance_double(PgPipeline::Pool, closing?: false)
+      allow(pool).to receive(:graceful_close)
+        .and_raise(PgPipeline::Error, "cannot close from inside a pinned block")
+      client = lifecycle_client(pool)
+
+      expect { described_class.close(client) }
+        .to raise_error(PgPipeline::Error, /cannot close/)
+      expect(described_class.started?(client)).to be(true)
+    end
+  end
+
   describe "public surface" do
     it "rejects unknown guard modes instead of falling back to default" do
       expect { PgPipeline::Client.new(nil, guard: :strcit) }
@@ -112,5 +144,4 @@ RSpec.describe PgPipeline::ClientOps do
       expect(client).not_to respond_to(:scheduler=)
     end
   end
-
 end

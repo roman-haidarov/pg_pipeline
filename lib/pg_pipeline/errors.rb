@@ -10,6 +10,7 @@ module PgPipeline
   class IndeterminateResultError < ConnectionLostError; end
   class ShutdownError < Error; end
   class ProtocolError < Error; end
+  class RecursiveCheckoutError < Error; end
 
   class QueryError < Error
     attr_reader :cause_result

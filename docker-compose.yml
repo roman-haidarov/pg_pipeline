@@ -11,3 +11,7 @@ services:
     image: postgres:17
     environment: { POSTGRES_PASSWORD: postgres }
     ports: ["5417:5432"]
+  pg18:
+    image: postgres:18
+    environment: { POSTGRES_PASSWORD: postgres }
+    ports: ["5418:5432"]

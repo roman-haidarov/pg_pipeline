@@ -92,7 +92,7 @@ RSpec.describe PgPipeline::Transaction do
     expect(run_error.message).to match(/fiber-local/)
     expect(conn.calls).to be_empty
 
-    tx.open = true
+    tx.__send__(:open=, true)
     savepoint_error = nil
     Fiber.new do
       begin
@@ -127,5 +127,15 @@ RSpec.describe PgPipeline::Transaction do
   it "rejects savepoint outside an open transaction" do
     tx = described_class.new(TxSpecConnection.new)
     expect { tx.savepoint { } }.to raise_error(PgPipeline::Error, /open transaction/)
+  end
+
+  it "does not expose transaction control state for external mutation (P1)" do
+    tx = described_class.new(TxSpecConnection.new)
+
+    expect(tx.open?).to be(false)
+    expect(tx).not_to respond_to(:open=)
+    expect(tx).not_to respond_to(:savepoint_seq)
+    expect(tx).not_to respond_to(:savepoint_seq=)
+    expect { tx.open = true }.to raise_error(NoMethodError)
   end
 end
