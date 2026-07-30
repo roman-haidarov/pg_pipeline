@@ -7,6 +7,7 @@ require "async/notification"
 
 require_relative "errors"
 require_relative "connection_driver"
+require_relative "prepared_statement"
 require_relative "server_caps"
 
 module PgPipeline
@@ -58,6 +59,10 @@ module PgPipeline
       @supervisor = nil
       @task_parent = nil
 
+      @prepared_statements = {}
+      @prepared_generation = 0
+      @statement_sequence = 0
+
       @pinned_free = []
       @pinned_in_use = {}
       @pinned_gate = nil
@@ -107,6 +112,61 @@ module PgPipeline
       driver
     end
 
+    def prepare_statement(client, name, sql, param_types)
+      ensure_available!
+      logical_name = PreparedStatementOps.snapshot_name(name)
+      if @prepared_statements.key?(logical_name)
+        raise Error, "prepared statement #{logical_name.inspect} already exists"
+      end
+
+      @statement_sequence += 1
+      statement = PreparedStatement.new(
+        client: client,
+        name: logical_name,
+        physical_name: "pgp_#{@statement_sequence.to_s(36)}",
+        sql: sql,
+        param_types: param_types
+      )
+
+      @prepared_statements[logical_name] = statement
+      @prepared_generation += 1
+      requests = []
+
+      begin
+        drivers = @drivers.select(&:available?)
+        if drivers.empty?
+          raise NotDispatchedError, "no live pipeline connections; statement was not prepared"
+        end
+
+        requests = drivers.map do |driver|
+          Request.prepare(statement).tap { |request| driver.submit(request) }
+        end
+
+        first_error = nil
+        requests.each do |request|
+          begin
+            RequestOps.clear_result(request.wait)
+          rescue StandardError => e
+            if first_error
+              e.clear_result! if e.respond_to?(:clear_result!)
+            else
+              first_error = e
+            end
+          end
+        end
+        raise first_error if first_error
+
+        statement
+      rescue Exception
+        if @prepared_statements.delete(logical_name)
+          @prepared_generation += 1
+        end
+        raise
+      ensure
+        requests.each { |request| request.cancel! unless request.settled? }
+      end
+    end
+
     def with_pinned
       ensure_available!
       raise @pinned_error if @pinned_error
@@ -154,6 +214,7 @@ module PgPipeline
           free: @pinned_free.size,
           in_use: @pinned_in_use.size
         },
+        prepared_statements: (@prepared_statements || {}).size,
         reconnects: @reconnects,
         health_failures: @health_failures,
         supervisor_error: @supervisor_error&.message,
@@ -352,11 +413,35 @@ module PgPipeline
 
     def start_pipeline_driver(parent)
       conn = PoolOps.new_connection(@connection_args)
+      prepare_registered_statements(conn)
       driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight)
       driver.start(parent: parent)
     rescue Exception
       PoolOps.safe_close(conn) if conn
       raise
+    end
+
+    def prepare_registered_statements(conn)
+      prepared = {}
+
+      loop do
+        generation = @prepared_generation || 0
+        statements = (@prepared_statements || {}).values.dup
+
+        statements.each do |statement|
+          next if prepared.key?(statement.physical_name)
+
+          result = if statement.param_types.nil?
+                     conn.prepare(statement.physical_name, statement.sql)
+                   else
+                     conn.prepare(statement.physical_name, statement.sql, statement.param_types)
+                   end
+          RequestOps.clear_result(result)
+          prepared[statement.physical_name] = true
+        end
+
+        break if generation == (@prepared_generation || 0)
+      end
     end
 
     def release_pinned(owner, conn)
@@ -473,32 +558,27 @@ module PgPipeline
     end
 
     def select_driver(drivers, rr)
-      min_load = nil
-      count = 0
-      drivers.each do |driver|
+      size = drivers.length
+      return [nil, rr] if size.zero?
+
+      best = nil
+      best_index = nil
+      best_load = nil
+
+      size.times do |offset|
+        index = (rr + offset) % size
+        driver = drivers[index]
         next unless driver.available?
 
         load = driver.load
-        if min_load.nil? || load < min_load
-          min_load = load
-          count = 1
-        elsif load == min_load
-          count += 1
+        if best.nil? || load < best_load
+          best = driver
+          best_index = index
+          best_load = load
         end
       end
-      return [nil, rr] if count.zero?
 
-      target = rr % count
-      index = 0
-      drivers.each do |driver|
-        next unless driver.available?
-        next unless driver.load == min_load
-
-        return [driver, rr + 1] if index == target
-
-        index += 1
-      end
-      [nil, rr]
+      best ? [best, (best_index + 1) % size] : [nil, rr]
     end
 
     def new_connection(connection_args)

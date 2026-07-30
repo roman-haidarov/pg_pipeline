@@ -26,6 +26,8 @@ for capability coverage.
 - pinned: concurrent transactions limited to `pinned_size`
 - driver abort mid-flight → `IndeterminateResultError`
 - reconnect: dead driver replaced, queries recover (`reconnect: true`)
+- explicit prepared statements execute across every pipeline driver
+- replacement drivers re-prepare the client catalog before accepting work
 - backend terminate + reconnect recovery
 - `abort!` cancels in-flight pinned `pg_sleep` quickly
 - savepoints on pinned transactions

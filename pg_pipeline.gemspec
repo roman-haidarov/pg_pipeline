@@ -40,10 +40,7 @@ Gem::Specification.new do |spec|
   # is enforced at runtime in ServerCaps via PG.library_version, NOT here.
   spec.add_dependency "pg", ">= 1.5", "< 2"
 
-  spec.files = Dir[
-    "lib/**/*.rb",
-    "README.md", "DESIGN.md", "LICENSE.txt", "CHANGELOG.md"
-  ]
+  spec.files = Dir["lib/**/*.rb", "README.md", "DESIGN.md", "LICENSE.txt", "CHANGELOG.md"]
   spec.require_paths = ["lib"]
 
   spec.add_development_dependency "rake", "~> 13.0"

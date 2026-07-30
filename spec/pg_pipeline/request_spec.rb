@@ -94,4 +94,43 @@ RSpec.describe PgPipeline::Request do
       expect(request.cancelled?).to be(true)
     end
   end
+
+  it "reuses an already-frozen SQL string without duplicating it" do
+    sql = "SELECT 1".freeze
+    request = described_class.new(sql: sql)
+
+    expect(request.sql).to equal(sql)
+    expect(request.instance_variables).not_to include(:@statement_name, :@param_types, :@operation)
+  end
+
+  it "builds prepared query requests without copying the statement SQL" do
+    statement = instance_double(
+      PgPipeline::PreparedStatement,
+      physical_name: "pgp_1".freeze,
+      sql: "SELECT $1::int".freeze
+    )
+
+    request = described_class.prepared_query(statement, params: [1])
+
+    expect(request.operation).to eq(:prepared_query)
+    expect(request.statement_name).to eq("pgp_1")
+    expect(request.sql).to equal(statement.sql)
+    expect(request.params).to eq([1])
+  end
+
+  it "builds prepare requests with a stable parameter type snapshot" do
+    param_types = [23, nil]
+    statement = instance_double(
+      PgPipeline::PreparedStatement,
+      physical_name: "pgp_2".freeze,
+      sql: "SELECT $1::int, $2".freeze,
+      param_types: param_types.freeze
+    )
+
+    request = described_class.prepare(statement)
+
+    expect(request.operation).to eq(:prepare)
+    expect(request.param_types).to eq([23, nil])
+    expect(request.param_types).to be_frozen
+  end
 end

@@ -70,6 +70,7 @@ throughput claims (it hooks every call and perturbs Async). Prefer:
 | `FIBERS` / `CONCURRENCY` | thrpt / ab | 2000 / 500 |
 | `BASELINE_POOL` | ab | 32 |
 | `QUERIES` | ab (per fiber) | 5 |
+| `PREPARED` | throughput, ab | `0`; set `1` to prepare both A/B clients |
 | `RTT_MS` / `UPSTREAM` / `LISTEN` | proxy | 10 / 5432 / 6432 |
 | `MEASURE` | profile | wall |
 | `ROUNDS` / `MIN_PERCENT` / `TOP_FIBERS` | profile | 3 / 1 / 8 |
@@ -108,3 +109,12 @@ the numbers.
 
 Profiling is not benchmarking: throughput / p50–p99 come from `bench:ab`
 (ideally through `bench:proxy` for realistic RTT), never from a profiled run.
+
+To isolate repeated Parse/Describe overhead without giving either side an
+unfair advantage, run the same A/B with prepared statements enabled for both
+clients:
+
+```bash
+PREPARED=1 CONCURRENCY=500 PIPELINE_SIZE=4 BASELINE_POOL=32 \
+  bundle exec rake bench:ab
+```

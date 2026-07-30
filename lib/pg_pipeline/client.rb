@@ -5,6 +5,7 @@ require "async"
 require_relative "errors"
 require_relative "pool"
 require_relative "request"
+require_relative "prepared_statement"
 require_relative "session_guard"
 require_relative "session"
 require_relative "transaction"
@@ -27,6 +28,7 @@ module PgPipeline
 
     def start(parent: Async::Task.current) = ClientOps.start(self, parent)
     def query(sql, params = []) = ClientOps.query(self, sql, params)
+    def prepare(name, sql, param_types = nil) = ClientOps.prepare(self, name, sql, param_types)
     def stats = ClientOps.stats(self)
 
     def session(&block)
@@ -71,11 +73,31 @@ module PgPipeline
 
     def query(client, sql, params)
       ensure_started!(client)
-      sql = sql.to_s
-      SessionGuard.assert_multiplexable!(sql, mode: client.guard)
+      sql = RequestOps.snapshot_sql(sql)
+      SessionGuard.assert_multiplexable_normalized!(sql, mode: client.guard)
 
-      request = submit_with_failover(client, sql, params)
+      wait_for_request do
+        submit_with_failover(client) { Request.new(sql: sql, params: params) }
+      end
+    end
 
+    def prepare(client, name, sql, param_types)
+      ensure_started!(client)
+      sql = RequestOps.snapshot_sql(sql)
+      SessionGuard.assert_multiplexable_normalized!(sql, mode: client.guard)
+      pool(client).__send__(:prepare_statement, client, name, sql, param_types)
+    end
+
+    def query_prepared(client, statement, params)
+      ensure_started!(client)
+
+      wait_for_request do
+        submit_with_failover(client) { Request.prepared_query(statement, params: params) }
+      end
+    end
+
+    def wait_for_request
+      request = yield
       begin
         request.wait
       ensure
@@ -85,13 +107,13 @@ module PgPipeline
 
     # NotDispatchedError is safe to retry on a fresh Request by contract.
     # ShutdownError is retried only while the current Request is still pre-dispatch.
-    def submit_with_failover(client, sql, params)
+    def submit_with_failover(client)
       attempts = 0
       limit = [pool(client).pipeline_size, 1].max
       last_error = nil
 
       while attempts < limit
-        request = Request.new(sql: sql, params: params)
+        request = yield
         begin
           pool(client).__send__(:pipeline_driver).submit(request)
           return request

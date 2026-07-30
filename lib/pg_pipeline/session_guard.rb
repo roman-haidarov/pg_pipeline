@@ -30,7 +30,11 @@ module PgPipeline
     }.freeze
 
     def assert_multiplexable!(sql, mode: :default)
-      reason = unsafe_reason(sql, mode: mode)
+      assert_multiplexable_normalized!(sql, mode: normalize_mode!(mode))
+    end
+
+    def assert_multiplexable_normalized!(sql, mode:)
+      reason = unsafe_reason_normalized(sql, mode: mode)
       return true unless reason
 
       raise UnsafeMultiplexError,
@@ -43,9 +47,12 @@ module PgPipeline
     GUARD_CACHE_LIMIT = 2048
 
     def unsafe_reason(sql, mode: :default)
-      mode = normalize_mode!(mode)
+      unsafe_reason_normalized(sql, mode: normalize_mode!(mode))
+    end
+
+    def unsafe_reason_normalized(sql, mode:)
       key = sql.to_s
-      cache = guard_cache[mode]
+      cache = guard_cache.fetch(mode)
       return cache[key] if cache.key?(key)
 
       reason = compute_unsafe_reason(key, mode)

@@ -11,7 +11,7 @@ module PgPipeline
                   :result, :error
 
     def initialize(sql:, params: nil)
-      @sql = sql.to_s.dup.freeze
+      @sql = RequestOps.snapshot_sql(sql)
       @params = RequestOps.snapshot_params(params)
       @state = :new
       @condition = Async::Notification.new
@@ -22,6 +22,14 @@ module PgPipeline
       @result = nil
       @error = nil
     end
+
+    def self.prepare(statement) = PrepareRequest.new(statement)
+
+    def self.prepared_query(statement, params: nil)
+      PreparedQueryRequest.new(statement, params: params)
+    end
+
+    def operation = :query
 
     def queued! = RequestOps.transition!(self, :new, :queued)
     def dispatched! = RequestOps.transition!(self, :queued, :dispatched)
@@ -38,8 +46,36 @@ module PgPipeline
     def settled? = @settled
   end
 
+  class PrepareRequest < Request
+    attr_reader :statement_name, :param_types
+
+    def initialize(statement)
+      super(sql: statement.sql)
+      @statement_name = RequestOps.snapshot_name(statement.physical_name)
+      @param_types = RequestOps.snapshot_param_types(statement.param_types)
+    end
+
+    def operation = :prepare
+  end
+
+  class PreparedQueryRequest < Request
+    attr_reader :statement_name
+
+    def initialize(statement, params: nil)
+      super(sql: statement.sql, params: params)
+      @statement_name = RequestOps.snapshot_name(statement.physical_name)
+    end
+
+    def operation = :prepared_query
+  end
+
   module RequestOps
     module_function
+
+    def snapshot_sql(sql)
+      value = sql.to_s
+      value.frozen? ? value : value.dup.freeze
+    end
 
     def snapshot_params(params)
       values = params.nil? ? [] : params
@@ -51,14 +87,30 @@ module PgPipeline
     def snapshot_value(value)
       case value
       when String
-        value.dup.freeze
+        value.frozen? ? value : value.dup.freeze
       when Hash
         value.each_with_object({}) do |(key, item), copy|
-          copy[key] = item.is_a?(String) ? item.dup.freeze : item
+          copy[key] = item.is_a?(String) && !item.frozen? ? item.dup.freeze : item
         end.freeze
       else
         value
       end
+    end
+
+    def snapshot_name(name)
+      value = name.to_s
+      raise ArgumentError, "statement_name must not be empty" if value.empty?
+
+      value.frozen? ? value : value.dup.freeze
+    end
+
+    def snapshot_param_types(param_types)
+      return nil if param_types.nil?
+      raise ArgumentError, "param_types must be an Array or nil" unless param_types.is_a?(Array)
+
+      param_types.map { |oid| oid.nil? ? nil : Integer(oid) }.freeze
+    rescue ArgumentError, TypeError
+      raise ArgumentError, "param_types must contain only integer OIDs or nil"
     end
 
     def transition!(req, from, to)

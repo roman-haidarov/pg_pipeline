@@ -11,21 +11,24 @@ url = BenchKit.require_url!
 fibers = Integer(ENV.fetch("FIBERS", "2000"))
 pipeline = Integer(ENV.fetch("PIPELINE_SIZE", "4"))
 sql = ENV.fetch("SQL", "SELECT 1")
+prepared = ENV["PREPARED"] == "1"
 
 puts "throughput bench"
-puts "url=#{BenchKit.redact_url(url)} fibers=#{fibers} pipeline_size=#{pipeline}"
+puts "url=#{BenchKit.redact_url(url)} fibers=#{fibers} pipeline_size=#{pipeline} prepared=#{prepared}"
 puts
 
 Sync do |task|
   client = PgPipeline::Client.new(url, pipeline_size: pipeline, pinned_size: 1, health_check: false)
     .start(parent: task)
+  statement = client.prepare("bench_throughput", sql) if prepared
   latencies = Array.new(fibers)
   t0 = BenchKit.now
 
   fibers.times.map do |i|
     task.async do
       s = BenchKit.now
-      client.query(sql)
+      result = prepared ? statement.query : client.query(sql)
+      result.clear
       latencies[i] = (BenchKit.now - s) * 1000.0
     end
   end.each(&:wait)

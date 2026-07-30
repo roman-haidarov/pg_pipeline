@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.2.3] - 2026-07-30
+
+Performance-focused release based on CPU profiles from the live pipeline
+workload. It removes redundant libpq polling, adds an explicit prepared-
+statement hot path, and trims several per-query control-plane costs without
+changing the failure model.
+
+### Added
+
+- `Client#prepare(name, sql, param_types = nil)` prepares immutable SQL on every
+  currently live pipeline connection and returns a `PreparedStatement` handle.
+- `PreparedStatement#query(params = [])` executes through
+  `send_query_prepared`, avoiding repeated Parse/Describe work for hot SQL.
+- Replacement pipeline connections replay the registered prepared-statement
+  catalog before becoming available, including registrations that race with a
+  reconnect.
+- Prepared-statement unit and live integration coverage, including execution
+  across multiple drivers and automatic re-prepare after reconnect.
+
+### Performance
+
+- The connection owner drains results only after `consume_input` actually read
+  a readable socket event. Removed unconditional pre/post-dispatch drain passes
+  that repeatedly called `PQisBusy` without new input.
+- A blocked `PQflush` is retried by the writer watcher instead of again on every
+  unrelated owner event. Newly queued output remains buffered in libpq until the
+  socket becomes writable.
+- Driver selection is now one circular least-load pass: each available driver's
+  `load` is read once and equal-load ties rotate from the selected slot.
+- The normalized SQL guard mode is reused on the query hot path instead of
+  coercing and validating it for every request.
+- Already-frozen SQL strings and frozen string bind values are reused rather
+  than duplicated; mutable caller input is still snapshotted before submission.
+- Prepared-only metadata lives on internal request subclasses, so ordinary
+  query requests do not grow extra instance variables for the new API.
+- The throughput and A/B harnesses explicitly clear every result and support
+  `PREPARED=1`, preparing both pipeline and baseline clients for a fair hot-path
+  comparison.
+
+### Semantics
+
+- Prepared statements are explicit client-scoped handles, not an automatic
+  unbounded SQL cache. The SQL guard runs once during registration.
+- Failed registration is removed from the reconnect catalog. Successfully
+  prepared but unreachable internal names may remain on already-prepared
+  physical connections until those connections close.
+- Multiplexed prepared handles live for the lifetime of the client; this release
+  intentionally does not add a concurrent `DEALLOCATE` API.
+
 ## [0.2.2] - 2026-07-30
 
 Lifecycle-hardening release. Fixes five pool/task-ownership defects surfaced by
