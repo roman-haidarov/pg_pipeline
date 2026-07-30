@@ -481,11 +481,17 @@ module PgPipeline
     end
 
     def stop_watchers(d)
-      d.reader_task&.stop
-      d.writer_task&.stop
+      reader = d.reader_task
+      writer = d.writer_task
       d.reader_task = nil
       d.writer_task = nil
-    rescue StandardError
+
+      [reader, writer].each do |task|
+        task&.stop
+      rescue Async::Cancel, StandardError
+        nil
+      end
+
       nil
     end
 

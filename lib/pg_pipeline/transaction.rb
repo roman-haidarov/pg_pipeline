@@ -6,8 +6,6 @@ require_relative "session"
 
 module PgPipeline
   class Transaction < Session
-    attr_accessor :open, :savepoint_seq
-
     def initialize(conn)
       super
       @open = false
@@ -23,6 +21,10 @@ module PgPipeline
     end
 
     def open? = @open
+
+    private
+
+    attr_accessor :open, :savepoint_seq
   end
 
   module TransactionOps
@@ -30,19 +32,17 @@ module PgPipeline
 
     def run(tx)
       SessionOps.ensure_active!(tx)
-      raise Error, "transaction is already open" if tx.open
+      raise Error, "transaction is already open" if tx.open?
 
       conn = SessionOps.connection(tx)
       conn.exec("BEGIN")
-      tx.open = true
+      tx.__send__(:open=, true)
       begin
         result = yield tx
         conn.exec("COMMIT")
-        tx.open = false
+        tx.__send__(:open=, false)
         result
       rescue Exception
-        # Only roll back the transaction we opened. Early guard errors
-        # ("already open", inactive handle) must not hit this path.
         rollback_quietly(tx)
         raise
       end
@@ -50,11 +50,12 @@ module PgPipeline
 
     def savepoint(tx, name)
       SessionOps.ensure_active!(tx)
-      raise Error, "savepoint requires an open transaction" unless tx.open
+      raise Error, "savepoint requires an open transaction" unless tx.open?
 
       conn = SessionOps.connection(tx)
-      tx.savepoint_seq += 1
-      point = name || "pgp_sp_#{tx.savepoint_seq}"
+      seq = tx.__send__(:savepoint_seq) + 1
+      tx.__send__(:savepoint_seq=, seq)
+      point = name || "pgp_sp_#{seq}"
       ident = conn.quote_ident(point)
 
       conn.exec("SAVEPOINT #{ident}")
@@ -79,14 +80,14 @@ module PgPipeline
     end
 
     def rollback_quietly(tx)
-      return unless tx.open
+      return unless tx.open?
 
       conn = SessionOps.connection(tx)
       conn&.exec("ROLLBACK")
     rescue PG::Error
       nil
     ensure
-      tx.open = false
+      tx.__send__(:open=, false)
     end
   end
 end

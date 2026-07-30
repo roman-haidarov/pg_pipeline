@@ -52,6 +52,7 @@ RSpec.describe PgPipeline::Pool do
       pool.instance_variable_set(:@rr, 0)
       pool.instance_variable_set(:@reconnects, 0)
       pool.instance_variable_set(:@supervisor, nil)
+      pool.instance_variable_set(:@task_parent, nil)
       pool.instance_variable_set(:@pinned_free, [])
       pool.instance_variable_set(:@pinned_in_use, {})
       pool.instance_variable_set(:@pinned_gate, nil)
@@ -61,6 +62,7 @@ RSpec.describe PgPipeline::Pool do
       pool.instance_variable_set(:@pinned_idle, Async::Notification.new)
       pool.instance_variable_set(:@started, true)
       pool.instance_variable_set(:@closing, false)
+      pool.instance_variable_set(:@closed, false)
       pool.instance_variable_set(:@driver_backoff, [0.0])
       pool.instance_variable_set(:@driver_attempts, [0])
       pool.instance_variable_set(:@driver_last_health, [0.0])
@@ -82,7 +84,7 @@ RSpec.describe PgPipeline::Pool do
     end
 
     it "replaces a dead pipeline driver and increments reconnects" do
-      Async do |task|
+      Sync do |task|
         pool = bare_pool
         dead = fake_driver(available: false, dead: true)
         live = fake_driver(available: true, dead: false)
@@ -96,11 +98,11 @@ RSpec.describe PgPipeline::Pool do
         expect(pool.reconnects).to eq(1)
         expect(pool.stats[:pipeline][:live]).to eq(1)
         expect(pool.stats[:reconnects]).to eq(1)
-      end.wait
+      end
     end
 
     it "applies exponential backoff when replacement fails" do
-      Async do |task|
+      Sync do |task|
         pool = bare_pool
         dead = fake_driver(available: false, dead: true)
         pool.instance_variable_set(:@drivers, [dead])
@@ -119,11 +121,11 @@ RSpec.describe PgPipeline::Pool do
         expect(pool).not_to receive(:start_pipeline_driver)
         pool.send(:reap_and_replace, task)
         expect(pool.instance_variable_get(:@driver_attempts)).to eq([1])
-      end.wait
+      end
     end
 
     it "skips drivers that are still draining (not dead yet)" do
-      Async do |task|
+      Sync do |task|
         pool = bare_pool
         draining = fake_driver(available: false, dead: false)
         pool.instance_variable_set(:@drivers, [draining])
@@ -131,7 +133,7 @@ RSpec.describe PgPipeline::Pool do
         expect(pool).not_to receive(:start_pipeline_driver)
         pool.send(:reap_and_replace, task)
         expect(pool.reconnects).to eq(0)
-      end.wait
+      end
     end
 
     it "reports no live drivers via select when all are dead" do
@@ -142,25 +144,27 @@ RSpec.describe PgPipeline::Pool do
     end
 
     it "does not reconnect dead drivers when reconnect is false but health checks are enabled" do
-      Async do |task|
+      Sync do |task|
         pool = bare_pool
+        pool.instance_variable_set(:@task_parent, task)
         pool.instance_variable_set(:@reconnect, false)
         pool.instance_variable_set(:@health_check, true)
         pool.instance_variable_set(:@closing, false)
 
         expect(pool).not_to receive(:reap_and_replace)
         expect(pool).to receive(:health_probe).once
-        allow(task).to receive(:sleep) do
+        allow(pool).to receive(:sleep) do
           pool.instance_variable_set(:@closing, true)
         end
 
         pool.send(:supervise)
-      end.wait
+      end
     end
 
     it "records supervisor errors and keeps looping" do
-      Async do |task|
+      Sync do |task|
         pool = bare_pool
+        pool.instance_variable_set(:@task_parent, task)
         pool.instance_variable_set(:@drivers, [])
         pool.instance_variable_set(:@reconnect, true)
         pool.instance_variable_set(:@health_check, false)
@@ -171,7 +175,7 @@ RSpec.describe PgPipeline::Pool do
           calls += 1
           raise "boom" if calls == 1
         end
-        allow(task).to receive(:sleep) do
+        allow(pool).to receive(:sleep) do
           pool.instance_variable_set(:@closing, true) if calls >= 2
         end
 
@@ -180,11 +184,11 @@ RSpec.describe PgPipeline::Pool do
         expect(calls).to be >= 2
         # Second successful iteration clears the transient supervisor_error.
         expect(pool.stats[:supervisor_error]).to be_nil
-      end.wait
+      end
     end
 
     it "health_probe aborts an idle driver that fails its probe" do
-      Async do
+      Sync do
         pool = bare_pool
         pool.instance_variable_set(:@health_check, true)
         pool.instance_variable_set(:@health_interval, 0.0)
@@ -196,11 +200,11 @@ RSpec.describe PgPipeline::Pool do
         expect(unhealthy).to receive(:abort!)
         pool.send(:health_probe)
         expect(pool.stats[:health_failures]).to eq(1)
-      end.wait
+      end
     end
 
     it "health_probe skips busy drivers" do
-      Async do
+      Sync do
         pool = bare_pool
         pool.instance_variable_set(:@health_check, true)
         pool.instance_variable_set(:@health_interval, 0.0)
@@ -212,11 +216,11 @@ RSpec.describe PgPipeline::Pool do
         expect(busy).not_to receive(:abort!)
         pool.send(:health_probe)
         expect(pool.stats[:health_failures]).to eq(0)
-      end.wait
+      end
     end
 
     it "abort! cancels checked-out pinned connections" do
-      Async do
+      Sync do
         pool = bare_pool
         pool.instance_variable_set(:@started, true)
         pool.instance_variable_set(:@closing, false)
@@ -230,7 +234,304 @@ RSpec.describe PgPipeline::Pool do
         pool.abort!
         expect(cancelled).to be(true)
         expect(pool.instance_variable_get(:@closing)).to be(true)
-      end.wait
+      end
+    end
+  end
+
+  describe "replacement-driver ownership (P0.1)" do
+    it "spawns replacements under the stable pool parent, not the supervisor task" do
+      Sync do |pool_parent|
+        pool = described_class.allocate
+        pool.instance_variable_set(:@task_parent, pool_parent)
+        pool.instance_variable_set(:@reconnect, true)
+        pool.instance_variable_set(:@health_check, false)
+        pool.instance_variable_set(:@reconnect_interval, 0.0)
+        pool.instance_variable_set(:@supervisor_error, nil)
+        pool.instance_variable_set(:@closing, false)
+
+        seen_parent = nil
+        allow(pool).to receive(:reap_and_replace) do |parent|
+          seen_parent = parent
+          pool.instance_variable_set(:@closing, true)
+        end
+
+        supervisor = pool_parent.async { pool.send(:supervise) }
+        supervisor.wait
+
+        expect(seen_parent).to equal(pool_parent)
+        expect(seen_parent).not_to equal(supervisor)
+      end
+    end
+  end
+
+  describe "abort! vs pinned recycle race (P0.2)" do
+    def pinned_state_pool
+      pool = described_class.allocate
+      pool.instance_variable_set(:@closing, false)
+      pool.instance_variable_set(:@pinned_free, [])
+      pool.instance_variable_set(:@pinned_active, 1)
+      pool.instance_variable_set(:@pinned_owners, Hash.new(0))
+      pool.instance_variable_set(:@pinned_idle, Async::Notification.new)
+      pool
+    end
+
+    it "closes a recycled connection when the pool started closing during recycle" do
+      Sync do
+        pool = pinned_state_pool
+        owner = Async::Task.current
+        pool.instance_variable_get(:@pinned_owners)[owner] = 1
+
+        conn = instance_double("PG::Connection")
+        recycled = instance_double("PG::Connection")
+
+        allow(pool).to receive(:recycle_pinned_connection) do
+          pool.instance_variable_set(:@closing, true)
+          recycled
+        end
+
+        expect(PgPipeline::PoolOps).to receive(:safe_close).with(recycled)
+
+        pool.send(:release_pinned, owner, conn)
+
+        expect(pool.instance_variable_get(:@pinned_free)).not_to include(recycled)
+      end
+    end
+  end
+
+  describe "cancellation during pinned recycle (P0.3)" do
+    it "closes the connection and re-raises when cancelled mid-cleanup" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@connection_args, nil)
+
+      conn = instance_double("PG::Connection", server_version: 90_400)
+      allow(PgPipeline::PoolOps)
+        .to receive(:sanitize_pinned_connection)
+        .and_raise(described_class::CANCEL_SIGNAL.new("Task was cancelled"))
+
+      expect(PgPipeline::PoolOps).to receive(:safe_close).with(conn)
+
+      expect { pool.send(:recycle_pinned_connection, conn) }
+        .to raise_error(described_class::CANCEL_SIGNAL)
+    end
+
+    it "uses a cancel signal that is NOT a StandardError (would bypass recovery)" do
+      expect(described_class::CANCEL_SIGNAL.ancestors).to include(Exception)
+      expect(described_class::CANCEL_SIGNAL.ancestors).not_to include(StandardError)
+    end
+  end
+
+  describe "recursive pinned checkout (P0.4)" do
+    it "rejects a nested checkout on the same task before touching the gate" do
+      Sync do
+        pool = described_class.allocate
+        pool.instance_variable_set(:@started, true)
+        pool.instance_variable_set(:@closing, false)
+        pool.instance_variable_set(:@closed, false)
+        pool.instance_variable_set(:@pinned_error, nil)
+        pool.instance_variable_set(:@pinned_size, 1)
+
+        owner = Async::Task.current
+        pool.instance_variable_set(:@pinned_owners, Hash.new(0).tap { |h| h[owner] = 1 })
+
+        gate = instance_double(Async::Semaphore)
+        pool.instance_variable_set(:@pinned_gate, gate)
+        expect(gate).not_to receive(:acquire)
+
+        expect { pool.send(:with_pinned) { flunk("block must not run") } }
+          .to raise_error(PgPipeline::RecursiveCheckoutError)
+      end
+    end
+
+    it "allows a fresh (non-nested) checkout on a task that holds no slot" do
+      Sync do
+        pool = described_class.allocate
+        pool.instance_variable_set(:@started, true)
+        pool.instance_variable_set(:@closing, false)
+        pool.instance_variable_set(:@closed, false)
+        pool.instance_variable_set(:@pinned_error, nil)
+        pool.instance_variable_set(:@pinned_size, 1)
+        pool.instance_variable_set(:@pinned_owners, Hash.new(0))
+
+        gate = instance_double(Async::Semaphore)
+        allow(gate).to receive(:acquire)
+        pool.instance_variable_set(:@pinned_gate, gate)
+
+        pool.send(:with_pinned) { :unused }
+
+        expect(gate).to have_received(:acquire)
+      end
+    end
+  end
+
+  describe "restart of a closing or closed pool (P0.5)" do
+    it "refuses to restart after close" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@started, false)
+      pool.instance_variable_set(:@closing, true)
+      pool.instance_variable_set(:@closed, true)
+
+      expect { pool.start }
+        .to raise_error(PgPipeline::ShutdownError, /cannot be restarted/)
+    end
+
+    it "refuses to restart while a previous close is still incomplete" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@started, false)
+      pool.instance_variable_set(:@closing, true)
+      pool.instance_variable_set(:@closed, false)
+
+      expect { pool.start }
+        .to raise_error(PgPipeline::ShutdownError, /cannot be restarted/)
+    end
+  end
+
+  describe "availability error classification" do
+    it "reports shutdown before the generic not-started state once closing begins" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@started, false)
+      pool.instance_variable_set(:@closing, true)
+
+      expect { pool.__send__(:ensure_available!) }
+        .to raise_error(PgPipeline::ShutdownError, /closing/)
+    end
+
+    it "keeps the generic lifecycle error before the first start" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@started, false)
+      pool.instance_variable_set(:@closing, false)
+      pool.instance_variable_set(:@closed, false)
+
+      expect { pool.__send__(:ensure_available!) }
+        .to raise_error(PgPipeline::Error, /not started/)
+    end
+
+    it "reports shutdown for a terminally closed pool even if closing is false" do
+      pool = described_class.allocate
+      pool.instance_variable_set(:@started, false)
+      pool.instance_variable_set(:@closing, false)
+      pool.instance_variable_set(:@closed, true)
+
+      expect { pool.__send__(:ensure_available!) }
+        .to raise_error(PgPipeline::ShutdownError, /closed/)
+    end
+  end
+
+  describe "partial start cleanup" do
+    it "aborts created drivers when supervisor creation fails" do
+      pool = described_class.new(nil, pipeline_size: 1, pinned_size: 0)
+      driver = instance_double(PgPipeline::ConnectionDriver)
+      parent = instance_double(Async::Task)
+
+      allow(pool).to receive(:start_pipeline_driver).with(parent).and_return(driver)
+      allow(parent).to receive(:async).and_raise(RuntimeError, "parent stopped")
+      expect(driver).to receive(:abort!)
+
+      expect { pool.start(parent: parent) }.to raise_error(RuntimeError, "parent stopped")
+      expect(pool.instance_variable_get(:@drivers)).to be_empty
+      expect(pool.instance_variable_get(:@task_parent)).to be_nil
+      expect(pool.instance_variable_get(:@started)).to be(false)
+      expect(pool.instance_variable_get(:@closing)).to be(false)
+    end
+  end
+
+  describe "timing option validation (P1)" do
+    it "rejects negative timing values" do
+      expect { described_class.new(nil, reconnect_interval: -1) }
+        .to raise_error(ArgumentError, /reconnect_interval/)
+    end
+
+    it "rejects NaN timing values" do
+      expect { described_class.new(nil, health_timeout: Float::NAN) }
+        .to raise_error(ArgumentError, /health_timeout/)
+    end
+
+    it "rejects infinite timing values" do
+      expect { described_class.new(nil, reconnect_backoff_max: Float::INFINITY) }
+        .to raise_error(ArgumentError, /reconnect_backoff_max/)
+    end
+
+    it "allows health_interval: 0 (probe every cycle)" do
+      expect { described_class.new(nil, health_interval: 0) }.not_to raise_error
+    end
+  end
+
+  describe "supervisor cadence (P1)" do
+    def cadence_pool(**overrides)
+      pool = described_class.allocate
+      defaults = {reconnect: true, reconnect_interval: 30.0, health_check: true, health_interval: 5.0}
+      defaults.merge(overrides).each { |k, v| pool.instance_variable_set(:"@#{k}", v) }
+      pool
+    end
+
+    it "wakes on the shorter health interval when reconnect interval is large" do
+      pool = cadence_pool(reconnect_interval: 30.0, health_interval: 5.0)
+      expect(pool.send(:supervisor_sleep_interval)).to eq(5.0)
+    end
+
+    it "keeps reconnect cadence when health_interval is 0 (probe every cycle)" do
+      pool = cadence_pool(reconnect_interval: 30.0, health_interval: 0.0)
+      expect(pool.send(:supervisor_sleep_interval)).to eq(30.0)
+    end
+
+    it "uses reconnect interval when health checks are disabled" do
+      pool = cadence_pool(reconnect_interval: 12.0, health_check: false, health_interval: 1.0)
+      expect(pool.send(:supervisor_sleep_interval)).to eq(12.0)
+    end
+  end
+
+  describe "reconnect backoff (P1)" do
+    def backoff_pool(interval:, max:)
+      pool = described_class.allocate
+      pool.instance_variable_set(:@reconnect_interval, interval)
+      pool.instance_variable_set(:@reconnect_backoff_max, max)
+      pool
+    end
+
+    it "caps very large attempt counts without constructing a giant integer" do
+      pool = backoff_pool(interval: 0.5, max: 30.0)
+      expect(pool.send(:next_backoff, 1_000)).to eq(30.0)
+    end
+
+    it "still reaches the configured ceiling for very small base intervals" do
+      pool = backoff_pool(interval: 1e-9, max: 30.0)
+      expect(pool.send(:next_backoff, 40)).to eq(30.0)
+    end
+
+    it "grows exponentially below the ceiling" do
+      pool = backoff_pool(interval: 0.5, max: 1000.0)
+      expect(pool.send(:next_backoff, 1)).to eq(0.5) # 0.5 * 2**0
+      expect(pool.send(:next_backoff, 3)).to eq(2.0) # 0.5 * 2**2
+    end
+  end
+
+  describe "driver shutdown cleanup" do
+    it "attempts every driver even when one close raises" do
+      pool = described_class.allocate
+      first = instance_double(PgPipeline::ConnectionDriver)
+      second = instance_double(PgPipeline::ConnectionDriver)
+      pool.instance_variable_set(:@drivers, [first, second])
+
+      allow(first).to receive(:abort!).and_raise(RuntimeError, "first failed")
+      expect(second).to receive(:abort!)
+
+      error = pool.send(:close_all_drivers, :abort!)
+      expect(error).to be_a(RuntimeError)
+      expect(error.message).to eq("first failed")
+    end
+
+    it "continues closing drivers and preserves cancellation over ordinary errors" do
+      pool = described_class.allocate
+      first = instance_double(PgPipeline::ConnectionDriver)
+      second = instance_double(PgPipeline::ConnectionDriver)
+      third = instance_double(PgPipeline::ConnectionDriver)
+      cancellation = described_class::CANCEL_SIGNAL.new("Task was cancelled")
+      pool.instance_variable_set(:@drivers, [first, second, third])
+
+      allow(first).to receive(:abort!).and_raise(RuntimeError, "first failed")
+      allow(second).to receive(:abort!).and_raise(cancellation)
+      expect(third).to receive(:abort!)
+
+      expect(pool.send(:close_all_drivers, :abort!)).to equal(cancellation)
     end
   end
 end

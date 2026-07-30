@@ -1,6 +1,86 @@
 # Changelog
 
-## [0.2.0] - unreleased
+## [0.2.2] - 2026-07-30
+
+Lifecycle-hardening release. Fixes five pool/task-ownership defects surfaced by
+review, adds input validation, and ships deterministic regression coverage for
+each fix.
+
+### Fixed (pool & task lifecycle)
+
+- Replacement pipeline drivers are now owned by the pool's stable parent task,
+  not the supervisor. Stopping the supervisor during shutdown can no longer
+  cascade-cancel a live replacement driver before it is gracefully drained.
+- Returning a pinned connection re-checks the closing state after the yielding
+  recycle step (`ROLLBACK`/`DISCARD ALL`/reconnect); a connection recycled while
+  a concurrent `abort!` runs is closed instead of leaked into the free list.
+- Task cancellation during pinned recycle (`Async::Cancel`/`Async::Stop` are
+  `Exception`s, not `StandardError`s) is caught solely to close the connection
+  and then re-raised, so cancellation semantics are preserved and the connection
+  is not leaked.
+- Nested `Client#session`/`Client#transaction` on the same task is rejected with
+  `RecursiveCheckoutError` before the pinned semaphore is acquired, preventing a
+  self-deadlock (`pinned_size: 1`) or a silently different connection
+  (`pinned_size > 1`). Use `Transaction#savepoint` for nested atomicity.
+- A closing or closed pool is terminal: `Pool#start` raises rather than
+  half-restarting onto stale driver state, including after an interrupted close.
+  Create a new pool instead.
+- Partial startup now also cleans up if spawning the supervisor task fails after
+  drivers were created.
+- Once shutdown begins, availability checks report `ShutdownError` before the
+  generic not-started state, preserving the definitely-not-dispatched failure
+  classification for concurrent submitters.
+
+### Changed (hardening)
+
+- Timing options (`reconnect_interval`, `reconnect_backoff_max`,
+  `health_interval`, `health_timeout`) reject negative, `NaN`, and infinite
+  values; `health_interval` additionally allows `0` ("probe every cycle").
+- The supervisor wakes on the shorter of the enabled reconnect/health cadences,
+  so a short `health_interval` is honored independently of a large
+  `reconnect_interval`, using scheduler-aware `Kernel#sleep` rather than the
+  deprecated `Async::Task#sleep` wrapper.
+- Reconnect backoff uses floating-point exponentiation and caps non-finite or
+  over-limit delays, avoiding giant integers without prematurely flattening the
+  backoff for very small base intervals.
+- `Transaction#open`/`#savepoint_seq` are no longer publicly writable; control
+  state is read via `#open?` and mutated only internally.
+- `Session#exec` accepts optional bind parameters (`exec(sql, params)`),
+  matching the documented API; any explicitly supplied params value, including
+  an empty array, uses `exec_params`, while omitted params keep simple-query mode.
+- Driver shutdown attempts every driver even if one close raises or the closing
+  task is cancelled, then re-raises cancellation after best-effort cleanup;
+  watcher cleanup still stops the writer when stopping the reader fails.
+- `Client#close`/`#abort!` now clear client lifecycle state even when terminal pool
+  cleanup reports an error, while a rejected re-entrant close leaves the live
+  client started.
+
+### Compatibility
+
+- Shutdown cleanup handles `Async::Cancel` explicitly. The supported dependency
+  floor (`async 2.42.0`) already defines that class, so no dead compatibility
+  fallback is required.
+- CI now runs the unit suite against exact `async 2.42.0`, builds ruby-pg against
+  source-built client libpq 14.23/16.14/17.10 and runs each build against a live
+  PostgreSQL server, plus a separate server integration matrix for 14/16/17/18.
+
+## [0.2.1]
+
+- SessionGuard: bounded per-SQL memo cache for unsafe_reason. Repeated SQL
+  (parameterized queries) now costs ~0 allocations instead of ~330 objects/call
+  (measured); eliminates the code_only/byteslice line that showed up in profiles.
+- Client#query: drop redundant sql dup (Request owns the one immutable copy).
+- PoolOps.select_driver: allocation-free least-loaded scan (was 2-3 arrays/call);
+  behavior verified identical across 20k random cases.
+- bench_kit/metrics.rb + rake bench:metrics: full picture in one run —
+  allocations/query + GC pressure, RubyProf process_time (CPU) and allocations,
+  RubyProf wall (sanity), and StackProf cpu/wall sampling. Asserts run outside
+  every profiler; warmup keeps connection setup out of frame.
+- profile_ci_scenario.rb: correctness asserts moved out of the profiled block;
+  GC.start before profiling.
+- Dev dependency: stackprof (~> 0.2).
+
+## [0.2.0]
 
 Initial experimental implementation.
 
@@ -103,7 +183,7 @@ Initial experimental implementation.
   even when the losing Request was already settled.
 - Strict guard precise denylist (no pg_typeof/setup/xact-advisory false positives).
 - CI separates server-major coverage from source-built client-libpq 14/16 coverage.
-- benchmarks/ (fiber-storm latency, multi-worker connection-count smoke).
+- `bench_kit/` (fiber-storm latency, multi-worker connection-count smoke).
 - Pool driver slot arrays self-heal size (reconnect/health safe under partial init).
 - Unit coverage: failover, health_probe, pinned cancel on abort.
 
@@ -138,19 +218,3 @@ Initial experimental implementation.
   boundary: cancellation during rollback/sanitize/reconnect closes the physical
   connection instead of orphaning it outside the pool. Graceful close also closes
   already-idle pinned sockets before waiting for active checkouts.
-
-## 0.2.1 (perf + measurement)
-
-- SessionGuard: bounded per-SQL memo cache for unsafe_reason. Repeated SQL
-  (parameterized queries) now costs ~0 allocations instead of ~330 objects/call
-  (measured); eliminates the code_only/byteslice line that showed up in profiles.
-- Client#query: drop redundant sql dup (Request owns the one immutable copy).
-- PoolOps.select_driver: allocation-free least-loaded scan (was 2-3 arrays/call);
-  behavior verified identical across 20k random cases.
-- bench_kit/metrics.rb + rake bench:metrics: full picture in one run —
-  allocations/query + GC pressure, RubyProf process_time (CPU) and allocations,
-  RubyProf wall (sanity), and StackProf cpu/wall sampling. Asserts run outside
-  every profiler; warmup keeps connection setup out of frame.
-- profile_ci_scenario.rb: correctness asserts moved out of the profiled block;
-  GC.start before profiling.
-- Dev dependency: stackprof (~> 0.2).

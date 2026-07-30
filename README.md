@@ -123,7 +123,7 @@ db.stats
 # }
 ```
 
-`load` (pending + in_flight) per driver is the head-of-line signal.
+`load` (pending + in-flight + submitting + dispatching) per driver is the routing/head-of-line signal.
 
 ## Failure model
 

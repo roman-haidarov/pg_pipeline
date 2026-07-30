@@ -18,6 +18,7 @@ module PgPipeline
     DEFAULT_HEALTH_INTERVAL = 10.0
     DEFAULT_HEALTH_TIMEOUT = 5.0
     DISCARD_SEQUENCES_SERVER_VERSION = 90_400
+    CANCEL_SIGNAL = Async::Cancel
 
     attr_reader :reconnects, :pipeline_size
 
@@ -39,11 +40,11 @@ module PgPipeline
       @max_pending = max_pending
       @max_in_flight = max_in_flight
       @reconnect = reconnect
-      @reconnect_interval = Float(reconnect_interval)
-      @reconnect_backoff_max = Float(reconnect_backoff_max)
+      @reconnect_interval = PoolOps.finite_float!(reconnect_interval, :reconnect_interval)
+      @reconnect_backoff_max = PoolOps.finite_float!(reconnect_backoff_max, :reconnect_backoff_max)
       @health_check = health_check
-      @health_interval = Float(health_interval)
-      @health_timeout = Float(health_timeout)
+      @health_interval = PoolOps.finite_float!(health_interval, :health_interval, allow_zero: true)
+      @health_timeout = PoolOps.finite_float!(health_timeout, :health_timeout)
       @cancel_pinned_on_abort = cancel_pinned_on_abort
 
       @drivers = []
@@ -55,6 +56,7 @@ module PgPipeline
       @health_failures = 0
       @supervisor_error = nil
       @supervisor = nil
+      @task_parent = nil
 
       @pinned_free = []
       @pinned_in_use = {}
@@ -66,10 +68,17 @@ module PgPipeline
 
       @started = false
       @closing = false
+      @closed = false
     end
 
-    def start(parent: Async::Task.current)
+    def start(parent: nil)
       raise Error, "pool already started" if @started
+      if @closing || @closed
+        raise ShutdownError, "pool is closing or was closed and cannot be restarted; create a new Pool"
+      end
+
+      parent ||= Async::Task.current
+      @task_parent = parent
 
       begin
         @pipeline_size.times { @drivers << start_pipeline_driver(parent) }
@@ -77,13 +86,13 @@ module PgPipeline
         @driver_attempts = Array.new(@drivers.size, 0)
         @driver_last_health = Array.new(@drivers.size, monotonic)
         @pinned_gate = Async::Semaphore.new(@pinned_size) if @pinned_size.positive?
+        @started = true
+        @supervisor = parent.async { supervise } if @reconnect || @health_check
       rescue Exception
         cleanup_partial_start
         raise
       end
 
-      @started = true
-      @supervisor = parent.async { supervise } if @reconnect || @health_check
       self
     end
 
@@ -102,6 +111,12 @@ module PgPipeline
       ensure_available!
       raise @pinned_error if @pinned_error
       raise Error, "pinned pool is disabled (pinned_size=0)" if @pinned_size.zero?
+
+      if @pinned_owners[Async::Task.current].positive?
+        raise RecursiveCheckoutError,
+              "nested Client#session/transaction on the same task is not allowed; " \
+              "use Transaction#savepoint for nested atomicity"
+      end
 
       @pinned_gate.acquire do
         raise @pinned_error if @pinned_error
@@ -143,6 +158,7 @@ module PgPipeline
         health_failures: @health_failures,
         supervisor_error: @supervisor_error&.message,
         closing: @closing,
+        closed: @closed,
         pinned_error: @pinned_error&.message
       }
     end
@@ -156,10 +172,24 @@ module PgPipeline
 
       @closing = true
       @started = false
-      stop_supervisor
-      @drivers.each(&:graceful_close)
-      wait_for_pinned_idle
-      close_free_pinned
+      first_error = nil
+
+      begin
+        first_error = preferred_shutdown_error(first_error, stop_supervisor)
+        first_error = preferred_shutdown_error(first_error, close_all_drivers(:graceful_close))
+
+        begin
+          wait_for_pinned_idle
+        rescue CANCEL_SIGNAL, StandardError => e
+          first_error = preferred_shutdown_error(first_error, e)
+        end
+      ensure
+        close_free_pinned
+        @closed = true
+      end
+
+      raise first_error if first_error
+
       nil
     end
 
@@ -168,29 +198,48 @@ module PgPipeline
 
       @closing = true
       @started = false
-      stop_supervisor
-      cancel_in_use_pinned if @cancel_pinned_on_abort
-      @drivers.each(&:abort!)
-      close_free_pinned
+      first_error = nil
+
+      begin
+        first_error = preferred_shutdown_error(first_error, stop_supervisor)
+        if @cancel_pinned_on_abort
+          first_error = preferred_shutdown_error(first_error, cancel_in_use_pinned)
+        end
+        first_error = preferred_shutdown_error(first_error, close_all_drivers(:abort!))
+      ensure
+        close_free_pinned
+        @closed = true
+      end
+
+      raise first_error if first_error
+
       nil
     end
 
     private
 
     def supervise
-      parent = Async::Task.current
       until @closing
         begin
-          reap_and_replace(parent) if @reconnect
+          reap_and_replace(@task_parent) if @reconnect
           health_probe if @health_check
           @supervisor_error = nil
         rescue StandardError => e
-          # Keep the loop alive: one probe/reconnect failure must not permanently
-          # disable health checks and replacement for the worker lifetime.
           @supervisor_error = e
         end
-        parent.sleep(@reconnect_interval)
+
+        break if @closing
+
+        sleep(supervisor_sleep_interval)
       end
+    end
+
+    def supervisor_sleep_interval
+      candidates = []
+      candidates << @reconnect_interval if @reconnect
+      candidates << @health_interval if @health_check && @health_interval.positive?
+      interval = candidates.min || @reconnect_interval
+      interval.positive? ? interval : @reconnect_interval
     end
 
     def reap_and_replace(parent)
@@ -242,28 +291,63 @@ module PgPipeline
     end
 
     def next_backoff(attempts)
-      delay = @reconnect_interval * (2**(attempts - 1))
-      delay < @reconnect_backoff_max ? delay : @reconnect_backoff_max
+      exponent = [Integer(attempts) - 1, 0].max
+      delay = @reconnect_interval * (2.0**exponent)
+      delay.finite? && delay < @reconnect_backoff_max ? delay : @reconnect_backoff_max
     end
 
     def cancel_in_use_pinned
+      cancellation = nil
+
       @pinned_in_use.keys.each do |conn|
         conn.cancel if conn.respond_to?(:cancel)
+      rescue CANCEL_SIGNAL => e
+        cancellation ||= e
       rescue StandardError
         nil
       end
+
+      cancellation
     end
 
     def stop_supervisor
-      @supervisor&.stop
+      supervisor = @supervisor
       @supervisor = nil
+      supervisor&.stop
+      nil
+    rescue CANCEL_SIGNAL => e
+      e
     rescue StandardError
       nil
     end
 
+    def close_all_drivers(method_name)
+      first_error = nil
+      cancellation = nil
+
+      @drivers.each do |driver|
+        begin
+          driver.public_send(method_name)
+        rescue CANCEL_SIGNAL => e
+          cancellation ||= e
+        rescue StandardError => e
+          first_error ||= e
+        end
+      end
+
+      cancellation || first_error
+    end
+
+    def preferred_shutdown_error(current, candidate)
+      return current unless candidate
+      return candidate if candidate.is_a?(CANCEL_SIGNAL)
+
+      current || candidate
+    end
+
     def ensure_available!
+      raise ShutdownError, "pool is closing or closed" if @closing || @closed
       raise Error, "pool not started" unless @started
-      raise ShutdownError, "pool is closing" if @closing
     end
 
     def start_pipeline_driver(parent)
@@ -282,7 +366,14 @@ module PgPipeline
             PoolOps.safe_close(conn)
           else
             recycled = recycle_pinned_connection(conn)
-            @pinned_free << recycled if recycled
+
+            if recycled
+              if @closing
+                PoolOps.safe_close(recycled)
+              else
+                @pinned_free << recycled
+              end
+            end
           end
         end
       ensure
@@ -301,6 +392,9 @@ module PgPipeline
 
       PoolOps.sanitize_pinned_connection(conn)
       conn
+    rescue CANCEL_SIGNAL
+      PoolOps.safe_close(conn)
+      raise
     rescue StandardError => cleanup_error
       PoolOps.safe_close(conn)
 
@@ -322,13 +416,20 @@ module PgPipeline
     def cleanup_partial_start
       @drivers.each do |driver|
         driver.abort!
-      rescue StandardError
+      rescue CANCEL_SIGNAL, StandardError
         nil
       end
       @drivers.clear
+      @driver_backoff.clear
+      @driver_attempts.clear
+      @driver_last_health.clear
       close_free_pinned
+      @pinned_gate = nil
+      @supervisor = nil
+      @task_parent = nil
       @started = false
       @closing = false
+      @closed = false
     end
 
     def close_free_pinned
@@ -349,6 +450,17 @@ module PgPipeline
       integer
     rescue ArgumentError, TypeError
       raise ArgumentError, "#{name} must be an integer >= 1"
+    end
+
+    def finite_float!(value, name, allow_zero: false)
+      number = Float(value)
+      bound_ok = allow_zero ? number >= 0 : number.positive?
+      raise ArgumentError unless number.finite? && bound_ok
+
+      number
+    rescue ArgumentError, TypeError
+      requirement = allow_zero ? "non-negative finite" : "positive finite"
+      raise ArgumentError, "#{name} must be a #{requirement} number (got #{value.inspect})"
     end
 
     def nonnegative_integer!(value, name)

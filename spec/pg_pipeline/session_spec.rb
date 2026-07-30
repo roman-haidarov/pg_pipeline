@@ -58,4 +58,28 @@ RSpec.describe PgPipeline::Session do
       .to raise_error(PgPipeline::Error, /no longer active/)
     expect(conn.calls).to eq([[:exec, "SELECT 1"]])
   end
+
+  it "routes exec with bind params to exec_params (P1)" do
+    conn = SessionSpecConnection.new
+    session = described_class.new(conn)
+
+    expect(session.exec("SELECT $1::int", [7])).to eq(:ok)
+    expect(conn.calls).to eq([[:exec_params, "SELECT $1::int", [7]]])
+  end
+
+  it "routes exec without params to the simple-query path (P1)" do
+    conn = SessionSpecConnection.new
+    session = described_class.new(conn)
+
+    session.exec("SET application_name = 'w'")
+    expect(conn.calls).to eq([[:exec, "SET application_name = 'w'"]])
+  end
+
+  it "uses extended protocol when params are explicitly an empty array" do
+    conn = SessionSpecConnection.new
+    session = described_class.new(conn)
+
+    session.exec("SELECT 1", [])
+    expect(conn.calls).to eq([[:exec_params, "SELECT 1", []]])
+  end
 end
