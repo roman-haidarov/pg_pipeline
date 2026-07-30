@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    pg_pipeline (0.2.2)
+    pg_pipeline (0.2.3)
       async (~> 2.42)
       pg (>= 1.5, < 2)
 

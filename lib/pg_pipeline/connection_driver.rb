@@ -196,42 +196,44 @@ module PgPipeline
     end
 
     def owner_loop(d)
-      while d.running
-        event = d.events.dequeue
-
-        case event
-        when :requests
-          d.request_event_pending = false
-        when :submission_finished
-          nil
-        when :readable
-          begin
-            read_available(d)
-          ensure
-            d.reader_rearm.enqueue(:rearm) if d.running
-          end
-        when :writable
-          d.writer_armed = false
-          flush_output(d)
-        when :close
-          d.draining = true
-        when Array
-          tag, payload = event
-          if tag == :abort
-            fatal_close(d, payload)
-            break
-          end
-        end
-
-        drain_results(d)
-        pump_requests(d)
-        drain_results(d)
-        finish_graceful_close(d) if d.draining && drained?(d)
-      end
+      process_event(d, d.events.dequeue) while d.running
     rescue StandardError => e
       fatal_close(d, ConnectionLostError.new("driver crashed: #{e.class}: #{e.message}"))
     ensure
       fatal_close(d, ShutdownError.new("driver owner stopped before shutdown completed")) if d.running
+    end
+
+    def process_event(d, event)
+      input_changed = false
+
+      case event
+      when :requests
+        d.request_event_pending = false
+      when :submission_finished
+        nil
+      when :readable
+        begin
+          read_available(d)
+          input_changed = true
+        ensure
+          d.reader_rearm.enqueue(:rearm) if d.running
+        end
+      when :writable
+        d.writer_armed = false
+        flush_output(d)
+      when :close
+        d.draining = true
+      when Array
+        tag, payload = event
+        if tag == :abort
+          fatal_close(d, payload)
+          return
+        end
+      end
+
+      drain_results(d) if input_changed
+      pump_requests(d) if d.running
+      finish_graceful_close(d) if d.running && d.draining && drained?(d)
     end
 
     def notify_requests(d)
@@ -261,12 +263,12 @@ module PgPipeline
         dispatched = true
       end
 
-      flush_output(d) if dispatched || d.needs_flush
+      flush_output(d) if dispatched && !d.needs_flush
     end
 
     def send_unit(d, request)
       begin
-        d.conn.send_query_params(request.sql, request.params)
+        send_command(d.conn, request)
       rescue PG::UnableToSend => e
         d.dispatching = nil
         request.reject!(
@@ -281,9 +283,11 @@ module PgPipeline
           NotDispatchedError.new("query was rejected before libpq accepted it: #{e.class}: #{e.message}")
         )
         raise ConnectionLostError, "dispatch failed: #{e.class}: #{e.message}"
+      rescue ProtocolError
+        raise
       rescue StandardError => e
-        # ruby-pg prepares/encodes query parameters before calling PQsendQueryParams.
-        # A Ruby-side encoder/coercion exception therefore belongs only to this
+        # ruby-pg prepares/encodes query parameters before calling PQsend*. A
+        # Ruby-side encoder/coercion exception therefore belongs only to this
         # request and must not poison unrelated work already in the pipeline.
         request.reject!(e)
         return false
@@ -293,6 +297,23 @@ module PgPipeline
       true
     rescue PG::Error => e
       raise ConnectionLostError, "dispatch Sync failed: #{e.class}: #{e.message}"
+    end
+
+    def send_command(conn, request)
+      case request.operation
+      when :query
+        conn.send_query_params(request.sql, request.params)
+      when :prepare
+        if request.param_types.nil?
+          conn.send_prepare(request.statement_name, request.sql)
+        else
+          conn.send_prepare(request.statement_name, request.sql, request.param_types)
+        end
+      when :prepared_query
+        conn.send_query_prepared(request.statement_name, request.params)
+      else
+        raise ProtocolError, "unsupported request operation #{request.operation.inspect}"
+      end
     end
 
     def reusable_after_send_rejection?(d)
@@ -325,7 +346,6 @@ module PgPipeline
 
     def read_available(d)
       d.conn.consume_input
-      drain_results(d)
     rescue PG::Error => e
       raise ConnectionLostError, "read failed: #{e.class}: #{e.message}"
     end

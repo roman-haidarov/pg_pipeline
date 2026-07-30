@@ -62,6 +62,35 @@ end
 `Client.open` manages the pool lifecycle. `db.query` is fiber-safe and multiplexed —
 every fiber yields while waiting, the event loop stays unblocked.
 
+### Multiplexed prepared statements
+
+For repeated SQL, prepare it once on every pipeline connection and execute the
+returned immutable handle:
+
+```ruby
+by_id = db.prepare(
+  "user_by_id",
+  "SELECT id, email, name FROM users WHERE id = $1",
+  [23] # optional PostgreSQL parameter OIDs
+)
+
+result = by_id.query([42])
+begin
+  p result.first
+ensure
+  result.clear
+end
+```
+
+`Client#prepare` returns only after the statement is ready on every currently
+live pipeline connection. Replacement connections automatically prepare the
+registered catalog before they begin accepting requests. The logical name is
+client-local; the gem uses private generated server names on its owned connections.
+
+Prepared handles are intentionally explicit rather than an unbounded automatic
+SQL cache. The SQL guard runs once at preparation time, while each execution
+still snapshots its bind values before submission.
+
 ### Transactions
 
 ```ruby
@@ -84,7 +113,7 @@ db.transaction do |tx|
 end
 ```
 
-### Session (DDL, LISTEN, SET, prepared statements)
+### Session (DDL, LISTEN, SET, connection-local prepared statements)
 
 ```ruby
 db.session do |s|
@@ -119,6 +148,7 @@ db.stats
 # => {
 #   pipeline: { size: 4, live: 4, drivers: [{load: 3, in_flight: 2, ...}, ...] },
 #   pinned:   { size: 2, active: 1, free: 1 },
+#   prepared_statements: 1,
 #   reconnects: 0
 # }
 ```

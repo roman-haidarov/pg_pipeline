@@ -51,10 +51,13 @@ sync_get_result
 `is_busy` is only a readiness predicate: false means the next
 `sync_get_result` will not block. It is not a request boundary.
 
-The owner also checks `is_busy` opportunistically before going back to sleep,
-not only after a socket-readable notification. PostgreSQL's own
-`libpq_pipeline.c` does the same because libpq can synthesize an aborted-pipeline
-result locally without making the socket newly readable.
+The owner calls `consume_input` on a socket-readable event and then drains until
+`is_busy` becomes true or the in-flight FIFO is empty. A drain pass exhausts all
+currently buffered results, including locally represented pipeline-aborted and
+pipeline-sync statuses. Request, writable and bookkeeping events therefore do
+not poll `is_busy` again: without a new `consume_input` they cannot reveal new
+server input, and the redundant Ruby-to-C calls were the largest control-plane
+CPU hot spot in profiling.
 
 ## 4. Protocol/FIFO model
 
@@ -111,6 +114,21 @@ Anything stateful goes through an exclusive pinned connection:
 
 - `Client#session` — no implicit BEGIN;
 - `Client#transaction` — BEGIN/COMMIT/ROLLBACK.
+
+The one deliberate exception is `Client#prepare`, which is not an arbitrary
+session mutation exposed to callers. It registers immutable SQL in a
+client-owned catalog and prepares the same generated physical name on every
+pipeline connection. The returned `PreparedStatement` handle can then use
+`send_query_prepared` through the normal FIFO protocol. A replacement connection
+replays the full catalog before it becomes available, so routing never selects a
+driver that lacks a successfully registered handle.
+
+Registration is explicit: there is no unbounded automatic SQL cache. A failed
+registration is removed from the reconnect catalog; statements that had already
+been prepared on another connection may remain there under an unreachable
+generated name until that connection is replaced or closed. Version 0.2.3 does
+not expose `DEALLOCATE` for multiplexed handles. Server-side plan invalidation is
+reported as the ordinary request-local `QueryError`.
 
 Pinned connections are opened lazily up to `pinned_size`; a query-only process
 does not reserve an otherwise idle second pool at startup. Before a pinned
@@ -250,6 +268,8 @@ chunked-rows, non-blocking cancel), never a floor.
   (`cancel_pinned_on_abort: true`); it does not force-close the socket if the
   backend ignores cancel.
 - No streaming/single-row/chunked-row result API.
+- No multiplexed prepared-statement deallocation API; registered handles live
+  for the lifetime of the client.
 - No cross-thread/reactor sharing; `Client` rejects use from a different thread or Fiber scheduler.
 - `SessionGuard` is policy/ergonomics, not a security boundary. `:strict` adds a
   precise denylist (`nextval`/`setval`/`pg_export_snapshot`, …) without the old

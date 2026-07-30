@@ -344,4 +344,100 @@ RSpec.describe PgPipeline::ConnectionDriver do
 
     expect { PgPipeline::DriverOps.stop_watchers(driver) }.not_to raise_error
   end
+
+  describe ".process_event" do
+    def event_driver(connection, inflight:)
+      driver = described_class.allocate
+      driver.instance_variable_set(:@conn, connection)
+      driver.instance_variable_set(:@inflight, inflight)
+      driver.instance_variable_set(:@max_in_flight, inflight.length)
+      driver.instance_variable_set(:@requests, instance_double(PgPipeline::BoundedQueue, empty?: true))
+      driver.instance_variable_set(:@reader_rearm, instance_double(Async::Queue, enqueue: nil))
+      driver.instance_variable_set(:@writer_commands, instance_double(Async::Queue, enqueue: nil))
+      driver.instance_variable_set(:@running, true)
+      driver.instance_variable_set(:@draining, false)
+      driver.instance_variable_set(:@needs_flush, false)
+      driver.instance_variable_set(:@writer_armed, false)
+      driver.instance_variable_set(:@request_event_pending, true)
+      driver.instance_variable_set(:@submitting, 0)
+      driver.instance_variable_set(:@dispatching, nil)
+      driver
+    end
+
+    it "does not poll PQisBusy for a request-queue event" do
+      req = request
+      connection = instance_double("PG::Connection")
+      expect(connection).not_to receive(:is_busy)
+      driver = event_driver(connection, inflight: [req])
+
+      PgPipeline::DriverOps.process_event(driver, :requests)
+
+      expect(driver.request_event_pending).to be(false)
+    end
+
+    it "consumes input and drains exactly once for a readable event" do
+      req = request
+      connection = instance_double("PG::Connection")
+      expect(connection).to receive(:consume_input).once
+      expect(connection).to receive(:is_busy).once.and_return(true)
+      driver = event_driver(connection, inflight: [req])
+
+      PgPipeline::DriverOps.process_event(driver, :readable)
+    end
+
+    it "flushes a writable event without polling for results" do
+      req = request
+      connection = instance_double("PG::Connection")
+      expect(connection).to receive(:sync_flush).once.and_return(true)
+      expect(connection).not_to receive(:is_busy)
+      driver = event_driver(connection, inflight: [req])
+      driver.writer_armed = true
+
+      PgPipeline::DriverOps.process_event(driver, :writable)
+
+      expect(driver.writer_armed).to be(false)
+    end
+
+    it "does not retry a blocked flush on an unrelated request event" do
+      req = request
+      connection = instance_double("PG::Connection")
+      expect(connection).not_to receive(:sync_flush)
+      driver = event_driver(connection, inflight: [req])
+      driver.needs_flush = true
+      driver.writer_armed = true
+
+      PgPipeline::DriverOps.process_event(driver, :requests)
+
+      expect(driver.needs_flush).to be(true)
+      expect(driver.writer_armed).to be(true)
+    end
+  end
+
+  describe ".send_command" do
+    let(:statement) do
+      PgPipeline::PreparedStatement.new(
+        client: Object.new,
+        name: "by_id",
+        physical_name: "pgp_1",
+        sql: "SELECT $1::int",
+        param_types: [23]
+      )
+    end
+
+    it "uses send_prepare for prepare units" do
+      connection = instance_double("PG::Connection")
+      request = PgPipeline::Request.prepare(statement)
+      expect(connection).to receive(:send_prepare).with("pgp_1", "SELECT $1::int", [23])
+
+      PgPipeline::DriverOps.send_command(connection, request)
+    end
+
+    it "uses send_query_prepared for prepared executions" do
+      connection = instance_double("PG::Connection")
+      request = PgPipeline::Request.prepared_query(statement, params: [7])
+      expect(connection).to receive(:send_query_prepared).with("pgp_1", [7])
+
+      PgPipeline::DriverOps.send_command(connection, request)
+    end
+  end
 end

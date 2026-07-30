@@ -19,7 +19,7 @@ RSpec.describe PgPipeline::ClientOps do
         allow(pool).to receive(:pipeline_driver).and_return(driver)
         allow(driver).to receive(:submit) { |request| request }
 
-        request = described_class.submit_with_failover(client, "SELECT 1", [])
+        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
         expect(request).to be_a(PgPipeline::Request)
         expect(driver).to have_received(:submit).once
       end.wait
@@ -42,7 +42,7 @@ RSpec.describe PgPipeline::ClientOps do
         end
         allow(live).to receive(:submit) { |request| request.queued!; request }
 
-        request = described_class.submit_with_failover(client, "SELECT 1", [])
+        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
         expect(request.state).to eq(:queued)
         expect(calls).to eq(2)
       end.wait
@@ -66,7 +66,7 @@ RSpec.describe PgPipeline::ClientOps do
         end
         allow(live).to receive(:submit) { |request| request.queued!; request }
 
-        request = described_class.submit_with_failover(client, "SELECT 1", [])
+        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
         expect(request.state).to eq(:queued)
         expect(calls).to eq(2)
       end.wait
@@ -81,11 +81,64 @@ RSpec.describe PgPipeline::ClientOps do
           .and_raise(PgPipeline::NotDispatchedError, "no live pipeline connections")
 
         expect {
-          described_class.submit_with_failover(client, "SELECT 1", [])
+          described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
         }.to raise_error(PgPipeline::NotDispatchedError)
 
         expect(driver).to have_received(:submit).twice
       end.wait
+    end
+  end
+
+  describe "prepared statements" do
+    def started_client(pool)
+      PgPipeline::Client.allocate.tap do |client|
+        client.instance_variable_set(:@pool, pool)
+        client.instance_variable_set(:@guard, :default)
+        client.instance_variable_set(:@started, true)
+        client.instance_variable_set(:@owner_thread, Thread.current)
+        client.instance_variable_set(:@scheduler, Fiber.scheduler)
+      end
+    end
+
+    it "checks SQL once and delegates registration to the pool" do
+      Sync do
+        pool = instance_double(PgPipeline::Pool)
+        client = started_client(pool)
+        statement = instance_double(PgPipeline::PreparedStatement)
+        sql = "SELECT $1::int"
+
+        expect(PgPipeline::SessionGuard).to receive(:assert_multiplexable_normalized!)
+          .with(sql, mode: :default)
+        expect(pool).to receive(:prepare_statement)
+          .with(client, "by_id", sql, [23])
+          .and_return(statement)
+
+        expect(described_class.prepare(client, "by_id", sql, [23])).to equal(statement)
+      end
+    end
+
+    it "submits a prepared-query request without re-running the SQL guard" do
+      Sync do
+        pool = instance_double(PgPipeline::Pool, pipeline_size: 1)
+        driver = instance_double(PgPipeline::ConnectionDriver)
+        client = started_client(pool)
+        statement = instance_double(PgPipeline::PreparedStatement, physical_name: "pgp_1", sql: "SELECT $1::int".freeze)
+        result = Object.new
+
+        allow(pool).to receive(:pipeline_driver).and_return(driver)
+        allow(driver).to receive(:submit) do |request|
+          expect(request.operation).to eq(:prepared_query)
+          request.queued!
+          request.dispatched!
+          request.accept_result(result)
+          request.query_boundary!
+          request.finish!
+          request
+        end
+        expect(PgPipeline::SessionGuard).not_to receive(:assert_multiplexable_normalized!)
+
+        expect(described_class.query_prepared(client, statement, [7])).to equal(result)
+      end
     end
   end
 
@@ -131,6 +184,7 @@ RSpec.describe PgPipeline::ClientOps do
       client = PgPipeline::Client.new(nil)
       expect(client).not_to respond_to(:pool)
       expect(client).to respond_to(:stats)
+      expect(client).to respond_to(:prepare)
     end
 
     it "does not expose lifecycle ownership state through public accessors" do

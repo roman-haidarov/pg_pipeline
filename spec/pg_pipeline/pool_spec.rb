@@ -534,4 +534,140 @@ RSpec.describe PgPipeline::Pool do
       expect(pool.send(:close_all_drivers, :abort!)).to equal(cancellation)
     end
   end
+
+  describe "least-loaded driver selection" do
+    it "reads each available driver load only once" do
+      first = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      second = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      expect(first).to receive(:load).once.and_return(2)
+      expect(second).to receive(:load).once.and_return(1)
+
+      driver, rr = PgPipeline::PoolOps.select_driver([first, second], 0)
+
+      expect(driver).to equal(second)
+      expect(rr).to eq(0)
+    end
+
+    it "continues after the selected driver when unequal loads become tied" do
+      first_load = 2
+      second_load = 1
+      first = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      second = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      allow(first).to receive(:load) { first_load }
+      allow(second).to receive(:load) { second_load }
+
+      selected, rr = PgPipeline::PoolOps.select_driver([first, second], 0)
+      second_load = 2
+      next_selected, = PgPipeline::PoolOps.select_driver([first, second], rr)
+
+      expect(selected).to equal(second)
+      expect(next_selected).to equal(first)
+    end
+
+    it "rotates equal-load drivers from the round-robin cursor" do
+      drivers = 3.times.map do
+        instance_double(PgPipeline::ConnectionDriver, available?: true, load: 0)
+      end
+
+      first, rr = PgPipeline::PoolOps.select_driver(drivers, 0)
+      second, rr = PgPipeline::PoolOps.select_driver(drivers, rr)
+      third, = PgPipeline::PoolOps.select_driver(drivers, rr)
+
+      expect([first, second, third]).to eq(drivers)
+    end
+  end
+
+  describe "multiplexed prepared statements" do
+    def prepared_pool(drivers)
+      described_class.allocate.tap do |pool|
+        pool.instance_variable_set(:@started, true)
+        pool.instance_variable_set(:@closing, false)
+        pool.instance_variable_set(:@closed, false)
+        pool.instance_variable_set(:@drivers, drivers)
+        pool.instance_variable_set(:@prepared_statements, {})
+        pool.instance_variable_set(:@prepared_generation, 0)
+        pool.instance_variable_set(:@statement_sequence, 0)
+      end
+    end
+
+    def accepting_driver
+      instance_double(PgPipeline::ConnectionDriver, available?: true).tap do |driver|
+        allow(driver).to receive(:submit) do |request|
+          result = instance_double("PG::Result")
+          allow(result).to receive(:clear)
+          request.queued!
+          request.dispatched!
+          request.accept_result(result)
+          request.query_boundary!
+          request.finish!
+          request
+        end
+      end
+    end
+
+    it "prepares a statement on every current live driver before returning the handle" do
+      drivers = [accepting_driver, accepting_driver]
+      pool = prepared_pool(drivers)
+      client = Object.new
+
+      statement = pool.send(:prepare_statement, client, "by_id", "SELECT $1::int", [23])
+
+      expect(statement).to be_a(PgPipeline::PreparedStatement)
+      expect(statement.physical_name).to eq("pgp_1")
+      drivers.each { |driver| expect(driver).to have_received(:submit).once }
+      expect(pool.instance_variable_get(:@prepared_statements)).to include("by_id" => statement)
+    end
+
+    it "removes a failed registration from the reconnect catalog" do
+      driver = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      allow(driver).to receive(:submit).and_raise(PgPipeline::NotDispatchedError, "driver died")
+      pool = prepared_pool([driver])
+
+      expect {
+        pool.send(:prepare_statement, Object.new, "bad", "SELECT 1", nil)
+      }.to raise_error(PgPipeline::NotDispatchedError)
+
+      expect(pool.instance_variable_get(:@prepared_statements)).to be_empty
+      expect(pool.instance_variable_get(:@prepared_generation)).to eq(2)
+    end
+
+    it "rejects duplicate logical names before dispatching another prepare" do
+      driver = accepting_driver
+      pool = prepared_pool([driver])
+
+      pool.send(:prepare_statement, Object.new, "same", "SELECT 1", nil)
+
+      expect {
+        pool.send(:prepare_statement, Object.new, "same", "SELECT 2", nil)
+      }.to raise_error(PgPipeline::Error, /already exists/)
+      expect(driver).to have_received(:submit).once
+    end
+
+    it "prepares the complete current catalog before a replacement starts" do
+      pool = prepared_pool([])
+      first = PgPipeline::PreparedStatement.new(
+        client: Object.new, name: "first", physical_name: "pgp_1", sql: "SELECT 1"
+      )
+      second = PgPipeline::PreparedStatement.new(
+        client: Object.new, name: "second", physical_name: "pgp_2", sql: "SELECT 2"
+      )
+      pool.instance_variable_set(:@prepared_statements, {"first" => first})
+      pool.instance_variable_set(:@prepared_generation, 1)
+
+      first_result = instance_double("PG::Result", clear: nil)
+      second_result = instance_double("PG::Result", clear: nil)
+      connection = instance_double("PG::Connection")
+      allow(connection).to receive(:prepare).with("pgp_1", "SELECT 1") do
+        pool.instance_variable_get(:@prepared_statements)["second"] = second
+        pool.instance_variable_set(:@prepared_generation, 2)
+        first_result
+      end
+      allow(connection).to receive(:prepare).with("pgp_2", "SELECT 2").and_return(second_result)
+
+      pool.send(:prepare_registered_statements, connection)
+
+      expect(connection).to have_received(:prepare).with("pgp_1", "SELECT 1").once
+      expect(connection).to have_received(:prepare).with("pgp_2", "SELECT 2").once
+    end
+  end
 end

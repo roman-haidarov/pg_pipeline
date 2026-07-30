@@ -202,6 +202,53 @@ RSpec.describe "pg_pipeline live", :integration do
     end
   end
 
+  it "executes an explicit prepared statement across all pipeline drivers" do
+    with_client(pipeline_size: 2, pinned_size: 0) do |db, task|
+      statement = db.prepare("typed_value", "SELECT $1::int AS n", [23])
+
+      values = (1..100).map do |n|
+        task.async do
+          result = statement.query([n])
+          begin
+            result.first["n"].to_i
+          ensure
+            result.clear
+          end
+        end
+      end.map(&:wait)
+
+      expect(values).to eq((1..100).to_a)
+      expect(db.stats[:prepared_statements]).to eq(1)
+    end
+  end
+
+  it "re-prepares registered statements on replacement drivers" do
+    with_client(pipeline_size: 1, pinned_size: 0, reconnect: true, reconnect_interval: 0.05) do |db, task|
+      statement = db.prepare("after_reconnect", "SELECT $1::int AS n", [23])
+      first = statement.query([7])
+      begin
+        expect(first.first["n"].to_i).to eq(7)
+      ensure
+        first.clear
+      end
+
+      driver = db.__send__(:pool).instance_variable_get(:@drivers).first
+      driver.abort!(PgPipeline::ConnectionLostError.new("simulated drop"))
+
+      deadline = Time.now + 5
+      until db.stats[:reconnects].positive? || Time.now > deadline
+        task.sleep(0.05)
+      end
+
+      result = statement.query([9])
+      begin
+        expect(result.first["n"].to_i).to eq(9)
+      ensure
+        result.clear
+      end
+    end
+  end
+
   it "rejects non-session-neutral SQL on the multiplexed path" do
     with_client(pipeline_size: 1, pinned_size: 1) do |db, _task|
       expect { db.query("SET application_name = 'x'") }
