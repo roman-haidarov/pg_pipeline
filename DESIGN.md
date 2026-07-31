@@ -126,7 +126,7 @@ driver that lacks a successfully registered handle.
 Registration is explicit: there is no unbounded automatic SQL cache. A failed
 registration is removed from the reconnect catalog; statements that had already
 been prepared on another connection may remain there under an unreachable
-generated name until that connection is replaced or closed. Version 0.2.3 does
+generated name until that connection is replaced or closed. Version 0.2.3 and later do
 not expose `DEALLOCATE` for multiplexed handles. Server-side plan invalidation is
 reported as the ordinary request-local `QueryError`.
 
@@ -221,15 +221,24 @@ without reset would leak that state to the next caller. After each pinned block:
 
 Immediately resuming a waiter from inside the connection owner is unsafe: a
 resumed caller could re-enter the driver (submit, or close the client and wait on
-the owner) while the owner is mid-`signal`. Internal wait/notify points therefore
-use `Async::Notification`, which resumes waiters on a later reactor turn, avoiding
-reentrancy into the owner. The same rule applies to request completion,
-bounded-queue backpressure and pinned-pool idle notifications.
+the owner) while the owner is still completing the current pipeline unit.
+
+A `Request` has exactly one consumer, so request completion stores that waiter
+fiber and its scheduler directly. `Scheduler#block` parks it, and
+`Scheduler#unblock` pushes it onto the selector for a later reactor turn. This
+preserves deferred wakeup without allocating a general-purpose
+`Async::Notification` and its queue objects for every query. The settled flag
+handles completion-before-wait, and an `ensure` removes a waiter interrupted by
+timeout or task cancellation before a late result can try to wake it.
+
+Multi-waiter coordination points still use `Async::Notification`: bounded-queue
+backpressure and pinned-pool idle notifications need queue/broadcast semantics
+that the request-specific one-shot waiter deliberately does not provide.
 
 > Note: the supported Async range starts at 2.42 and stays below 3. The lockfile
 > exercises the current compatible 2.x release, while CI separately runs the unit
-> suite against the exact 2.42.0 floor so this coordination behavior is not merely
-> assumed from a broad pessimistic dependency range.
+> suite against the exact 2.42.0 floor so `Scheduler#block`/`#unblock` behavior is
+> not merely assumed from a broad pessimistic dependency range.
 
 ## 11. Version policy
 

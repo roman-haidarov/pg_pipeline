@@ -1,26 +1,25 @@
 # frozen_string_literal: true
 
-require "async/notification"
-
 require_relative "errors"
 
 module PgPipeline
   class Request
-    attr_reader :sql, :params, :condition
+    attr_reader :sql, :params
     attr_accessor :state, :cancelled, :settled, :result_seen, :query_boundary_seen,
-                  :result, :error
+                  :result, :error, :waiter, :waiter_scheduler
 
     def initialize(sql:, params: nil)
       @sql = RequestOps.snapshot_sql(sql)
       @params = RequestOps.snapshot_params(params)
       @state = :new
-      @condition = Async::Notification.new
       @cancelled = false
       @settled = false
       @result_seen = false
       @query_boundary_seen = false
       @result = nil
       @error = nil
+      @waiter = nil
+      @waiter_scheduler = nil
     end
 
     def self.prepare(statement) = PrepareRequest.new(statement)
@@ -156,7 +155,7 @@ module PgPipeline
 
       req.settled = true
       req.state = :done
-      req.condition.signal unless req.cancelled
+      wake_waiter(req) unless req.cancelled
     end
 
     def reject!(req, error)
@@ -167,7 +166,7 @@ module PgPipeline
       req.error ||= error
       req.settled = true
       req.state = :done
-      req.condition.signal unless req.cancelled
+      wake_waiter(req) unless req.cancelled
     end
 
     def cancel!(req)
@@ -180,10 +179,40 @@ module PgPipeline
     end
 
     def wait(req)
-      req.condition.wait unless req.settled
+      park_waiter(req) unless req.settled
       raise req.error if req.error
 
       req.result
+    end
+
+    def park_waiter(req)
+      raise ProtocolError, "request already has a waiter" if req.waiter
+
+      scheduler = Fiber.scheduler
+      raise Error, "request wait requires an active Fiber scheduler" unless scheduler
+
+      waiter = Fiber.current
+      req.waiter = waiter
+      req.waiter_scheduler = scheduler
+
+      begin
+        scheduler.block(req, nil) until req.settled
+      ensure
+        if req.waiter.equal?(waiter)
+          req.waiter = nil
+          req.waiter_scheduler = nil
+        end
+      end
+    end
+
+    def wake_waiter(req)
+      waiter = req.waiter
+      scheduler = req.waiter_scheduler
+
+      req.waiter = nil
+      req.waiter_scheduler = nil
+
+      scheduler.unblock(req, waiter) if scheduler && waiter
     end
 
     def assert_result_slot!(req)

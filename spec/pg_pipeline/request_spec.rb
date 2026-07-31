@@ -95,6 +95,65 @@ RSpec.describe PgPipeline::Request do
     end
   end
 
+  it "parks one fiber and wakes it when the request settles" do
+    async_example do |task|
+      request = dispatched_request
+      result = request_result.new(false)
+      waiter = task.async { request.wait }
+
+      task.yield
+
+      request.accept_result(result)
+      request.query_boundary!
+      request.finish!
+
+      expect(waiter.wait).to equal(result)
+      expect(request.waiter).to be_nil
+      expect(request.waiter_scheduler).to be_nil
+    end
+  end
+
+  it "rejects a second concurrent waiter instead of losing the first one" do
+    async_example do |task|
+      request = dispatched_request
+      first_waiter = task.async { request.wait }
+
+      task.yield
+
+      expect { request.wait }
+        .to raise_error(PgPipeline::ProtocolError, "request already has a waiter")
+
+      request.reject!(PgPipeline::ShutdownError.new("closing"))
+      expect { first_waiter.wait }.to raise_error(PgPipeline::ShutdownError, "closing")
+    end
+  end
+
+  it "clears an interrupted waiter before a late completion" do
+    async_example do |task|
+      request = dispatched_request
+      waiter = task.async do |child|
+        child.with_timeout(0.01) { request.wait }
+      end
+
+      expect { waiter.wait }.to raise_error(Async::TimeoutError)
+      expect(request.waiter).to be_nil
+      expect(request.waiter_scheduler).to be_nil
+
+      request.reject!(PgPipeline::ConnectionLostError.new("late failure"))
+      expect { request.wait }.to raise_error(PgPipeline::ConnectionLostError, "late failure")
+    end
+  end
+
+  it "requires a scheduler only while an unsettled request must block" do
+    request = dispatched_request
+
+    expect { request.wait }
+      .to raise_error(PgPipeline::Error, "request wait requires an active Fiber scheduler")
+
+    request.reject!(PgPipeline::ShutdownError.new("closed"))
+    expect { request.wait }.to raise_error(PgPipeline::ShutdownError, "closed")
+  end
+
   it "reuses an already-frozen SQL string without duplicating it" do
     sql = "SELECT 1".freeze
     request = described_class.new(sql: sql)
