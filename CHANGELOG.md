@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.2.4] - 2026-07-31
+
+Request-completion allocation patch. It replaces the general-purpose
+`Async::Notification` attached to every multiplexed request with a direct
+single-waiter fiber handoff while preserving deferred reactor wakeups and the
+existing SQL, Sync, result and failure semantics.
+
+### Performance
+
+- A request now stores only the waiting fiber and its originating scheduler.
+  `Scheduler#block` parks that fiber and `Scheduler#unblock` schedules only that
+  waiter on a later reactor turn.
+- Removed the per-request `Async::Notification` and its initial
+  `Thread::Queue`; when a waiter is present, completion also avoids the
+  replacement queue and `Async::Notification::Signal` allocation.
+- The optimization is limited to one-shot request completion. Bounded-queue and
+  pinned-pool notifications retain `Async::Notification` because they require
+  multi-waiter coordination.
+
+### Reliability
+
+- Completion-before-wait still returns immediately through the settled guard, so
+  no wakeup can be lost.
+- Timeout or task cancellation clears the stored waiter in an `ensure`, preventing
+  a late query completion from retaining or waking an abandoned fiber.
+- A second concurrent waiter is rejected explicitly instead of silently replacing
+  the first waiter.
+- The scheduler associated with the waiting fiber is stored and used for the
+  matching unblock rather than looking up an implicit current scheduler at
+  completion time.
+- Added focused coverage for wait-before-completion, completion after an
+  interrupted wait, the single-waiter invariant and already-settled waits outside
+  an active scheduler.
+
 ## [0.2.3] - 2026-07-30
 
 Performance-focused release based on CPU profiles from the live pipeline

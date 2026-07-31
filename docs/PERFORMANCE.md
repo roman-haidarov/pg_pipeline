@@ -1,12 +1,16 @@
 # Performance tests
 
-Version under test: **`pg_pipeline 0.2.3`**  
+Current release under test: **`pg_pipeline 0.2.4`**
+
+Historical comparison release: **`pg_pipeline 0.2.3`**
+
 Results collected: **2026-07-30 to 2026-07-31**
 
-This document consolidates the performance work performed for `pg_pipeline 0.2.3`.
-It includes the in-process benchmark kit, fixed-arrival-rate HTTP SLA tests, raw
-closed-loop HTTP throughput, connection-count experiments, RTT amortization, and
-post-optimization profiling.
+This document consolidates the performance work performed for `pg_pipeline 0.2.3`
+and the final release A/B for `0.2.4`. The latest HTTP matrices below use the final
+60-second measurements for `0.2.3`, `0.2.4`, and the direct `pg` baseline. Older
+in-process, RTT, connection-count, and profiling results are retained and explicitly
+marked where they were collected before `0.2.4`.
 
 These numbers are a practical reference, not a universal capacity guarantee.
 Results depend on CPU, PostgreSQL version and configuration, query cost, network
@@ -14,28 +18,33 @@ RTT, Falcon/Ruby versions, connection counts, and workload shape.
 
 ## Executive summary
 
-The strongest externally observed result was the closed-loop HTTP saturation test:
+The final closed-loop HTTP saturation comparison used two 60-second `oha` runs per
+variant and reports the arithmetic mean:
 
 | Variant | PostgreSQL connections | Requests/sec | Average | p50 | p95 | p99 | Success |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `pg_pipeline` | 16 | **19,002.7** | **52.6 ms** | **49.8 ms** | **86.7 ms** | **108.6 ms** | 100% |
-| Direct `pg` pool | 32 | 14,541.1 | 68.7 ms | 68.6 ms | 111.1 ms | 141.8 ms | 100% |
+| `pg_pipeline 0.2.4` | 16 | **21,432.2** | **46.65 ms** | **43.00 ms** | **80.40 ms** | 102.85 ms | 100% |
+| `pg_pipeline 0.2.3` | 16 | 20,336.2 | 49.15 ms | 45.80 ms | 83.85 ms | 105.85 ms | 100% |
+| Direct `pg` pool | 32 | 16,287.8 | 61.36 ms | 59.16 ms | 85.73 ms | **102.10 ms** | 100% |
 
-In that single run, `pg_pipeline` delivered about **30.7% more RPS**, with lower
-latency, while using half as many PostgreSQL connections. Throughput per server
-connection was approximately **1,188 RPS/connection** for the pipeline path versus
-**454 RPS/connection** for the direct pool, or about **2.6x greater connection
-efficiency**.
+Relative to `0.2.3`, the `0.2.4` request-completion primitive delivered about
+**5.4% more maximum RPS**, **5.1% lower average latency**, **6.1% lower median
+latency**, and **4.1% lower p95**. Relative to the direct pool, `0.2.4` delivered
+about **31.6% more RPS** while using half as many PostgreSQL connections.
+Throughput per server connection was approximately **1,340 RPS/connection** for
+`0.2.4`, **1,271 RPS/connection** for `0.2.3`, and **509 RPS/connection** for the
+direct pool. The latest pipeline path therefore achieved about **2.6x greater
+connection efficiency** than the direct pool in this workload.
 
-The fixed-arrival-rate tests tell a complementary story. At a target of 15,000 RPS,
-the pipeline path came very close to the selected SLA while the direct pool was
-already heavily queued. At 17,000 and 20,000 target RPS both variants were overloaded,
-but the pipeline path consistently completed more work, dropped fewer iterations,
-and had lower latency.
+The fixed-arrival-rate tests show the more operationally important result. At a
+target of 15,000 RPS, `0.2.4` was the only variant that passed the selected latency
+and dropped-iteration thresholds. At 17,000 RPS it still missed the drop threshold,
+but kept p95 below 60 ms and required roughly half as many virtual users as `0.2.3`.
+The direct pool was already severely queued at 15,000 RPS.
 
 ## Test environment
 
-The HTTP comparisons used the same local test shape for both variants:
+The HTTP comparisons used the same local test shape for all variants:
 
 - macOS MacBook Pro host
 - load generator running on the same host as Docker Desktop
@@ -46,12 +55,17 @@ The HTTP comparisons used the same local test shape for both variants:
 - 100,000 seeded users; each request selected a user by ID
 - unprepared SQL for the HTTP comparisons in this document
 - `pg_pipeline`: 4 multiplexed connections per worker, 16 active server connections
-- direct `pg`: usually 8 ordinary connections per worker, 32 active server connections
+- direct `pg`: 8 ordinary connections per worker, 32 active server connections
 
 Because the database, application, and load generator shared one physical machine,
 these tests include contention from Docker Desktop and the load generator itself.
 The local database RTT was close to zero, which is the least favorable environment
 for demonstrating round-trip amortization.
+
+For the final release comparison, each variant was rebuilt and started in its own
+Docker Compose run. The `oha` table uses two runs per variant. Each k6 row is one
+60-second run, so the direction of the result is stronger evidence than the exact
+magnitude of every overload percentage.
 
 ## 1. Closed-loop maximum HTTP throughput (`oha`)
 
@@ -71,28 +85,50 @@ oha \
   'http://127.0.0.1:3000/users/[1-9][0-9]{0,4}'
 ```
 
-| Metric | `pg_pipeline` (16 conn) | Direct `pg` (32 conn) | Pipeline difference |
-|---|---:|---:|---:|
-| Requests/sec | **19,002.7** | 14,541.1 | **+30.7%** |
-| Completed responses | **1,141,335** | 874,195 | +267,140 |
-| Average | **52.6 ms** | 68.7 ms | **-23.4%** |
-| p50 | **49.8 ms** | 68.6 ms | **-27.4%** |
-| p95 | **86.7 ms** | 111.1 ms | **-22.0%** |
-| p99 | **108.6 ms** | 141.8 ms | **-23.4%** |
-| Slowest | 1.272 s | **574.1 ms** | worse extreme outlier |
-| HTTP 200 | 100% | 100% | equal |
+### Raw runs and two-run means
 
-Interpretation: the pipeline path produced a clear raw-throughput gain and better
-central/tail latency through p99, but it also recorded a worse single maximum outlier.
-This was one run per variant. The pipeline run had an explicit 10-second warmup in
-the captured terminal log; the direct run's explicit warmup was not captured. The
-database was restarted between variants, so this result should be treated as a
-strong indicative measurement rather than a publication-grade multi-run median.
+| Variant | Run 1 RPS | Run 2 RPS | Mean RPS | Mean average | Mean p50 | Mean p95 | Mean p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `pg_pipeline 0.2.4` | 21,402.6 | 21,461.8 | **21,432.2** | **46.65 ms** | **43.00 ms** | **80.40 ms** | 102.85 ms |
+| `pg_pipeline 0.2.3` | 20,542.4 | 20,130.0 | 20,336.2 | 49.15 ms | 45.80 ms | 83.85 ms | 105.85 ms |
+| Direct `pg` pool | 16,364.8 | 16,210.8 | 16,287.8 | 61.36 ms | 59.16 ms | 85.73 ms | **102.10 ms** |
+
+### `0.2.4` change relative to `0.2.3`
+
+| Metric | `0.2.3` mean | `0.2.4` mean | Change |
+|---|---:|---:|---:|
+| Requests/sec | 20,336.2 | **21,432.2** | **+5.39%** |
+| Completed responses/run | 1,221,224 | **1,286,987** | **+5.38%** |
+| Average | 49.15 ms | **46.65 ms** | **-5.09%** |
+| p10 | 28.35 ms | **26.90 ms** | **-5.11%** |
+| p25 | 35.55 ms | **33.25 ms** | **-6.47%** |
+| p50 | 45.80 ms | **43.00 ms** | **-6.11%** |
+| p75 | 58.50 ms | **55.60 ms** | **-4.96%** |
+| p90 | 73.45 ms | **70.15 ms** | **-4.49%** |
+| p95 | 83.85 ms | **80.40 ms** | **-4.11%** |
+| p99 | 105.85 ms | **102.85 ms** | **-2.83%** |
+| p99.9 | **146.35 ms** | 146.80 ms | +0.31% worse |
+| p99.99 | **955.5 ms** | 1,199.9 ms | +25.58% worse |
+| Slowest | **1.270 s** | 1.609 s | +26.73% worse |
+
+`0.2.4` improved every central latency percentile through p99 and increased raw
+throughput. The extreme `oha` tail was worse: p99.99 and the single slowest response
+increased. This tail represents roughly one request in ten thousand and did not
+repeat in the fixed-rate k6 comparison, where maximum latency improved at both
+15,000 and 17,000 target RPS. It remains an observation to monitor rather than a
+reason to hide or discard the release result.
+
+Relative to the direct pool, `0.2.4` produced **31.6% more RPS**, **24.0% lower
+average latency**, **27.3% lower median latency**, and **6.2% lower p95**, while
+using 16 rather than 32 PostgreSQL connections. Direct `pg` had a marginally lower
+mean p99 in this particular closed-loop comparison, but materially lower throughput
+and worse latency across the rest of the distribution.
 
 ## 2. Fixed-arrival-rate HTTP SLA (`k6`)
 
 The fixed-rate tests used an open-loop workload. Unlike `oha`, k6 attempted to inject
-a specified RPS even when the server was already queued.
+a specified RPS even when the server was already queued. The final comparison used
+60-second runs at 15,000 and 17,000 target RPS.
 
 The selected SLA was:
 
@@ -105,38 +141,40 @@ The selected SLA was:
 All rows below had 0% HTTP failures and 100% successful status checks. A failed SLA
 therefore means excessive latency and/or dropped iterations, not incorrect responses.
 
-### Consolidated results
+### Consolidated final results
 
-| Target | Variant | Conn | Actual RPS | Dropped | Drop rate | p50 | p95 | p99 | SLA |
-|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
-| 15,000 | `pg_pipeline` | 16 | **14,979.3** | **1,020** | **0.113%** | **7.87 ms** | **48.37 ms** | **83.23 ms** | Near pass: drops only |
-| 15,000 | Direct `pg` | 32 | 14,762.4 | 13,440 | 1.493% | 29.86 ms | 272.37 ms | 439.59 ms | Fail |
-| 17,000 | `pg_pipeline` | 16 | **15,855.9** | **33,549** | **3.289%** | **137.05 ms** | **488.08 ms** | **807.52 ms** | Fail / overloaded |
-| 17,000 | Direct `pg` | 32 | 15,530.6 | 77,944 | 7.641% | 236.98 ms | 772.08 ms | ~1.10 s | Fail / overloaded |
-| 20,000 | `pg_pipeline` | 16 | **17,569.1** | **133,964** | **11.163%** | **232.38 ms** | **391.03 ms** | **910.70 ms** | Fail / overloaded |
-| 20,000 | Direct `pg` | 32 | 14,990.2 | 288,248 | 24.021% | 283.85 ms | 617.23 ms | 964.72 ms | Fail / overloaded |
+| Target | Variant | Conn | Actual RPS | Dropped | Drop rate | Average | p50 | p95 | p99 | Max VUs | SLA |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 15,000 | `pg_pipeline 0.2.4` | 16 | **14,984.7** | **847** | **0.094%** | **12.44 ms** | **6.44 ms** | **44.37 ms** | **80.66 ms** | **1,033** | **Pass** |
+| 15,000 | `pg_pipeline 0.2.3` | 16 | 14,961.4 | 1,835 | 0.204% | 14.66 ms | 7.93 ms | 51.34 ms | 82.62 ms | 1,110 | Fail: drops |
+| 15,000 | Direct `pg` | 32 | 14,439.6 | 31,259 | 3.473% | 158.08 ms | 103.94 ms | 440.34 ms | 660.35 ms | 5,000 | Fail: drops and latency |
+| 17,000 | `pg_pipeline 0.2.4` | 16 | **16,942.1** | **3,300** | **0.324%** | **21.58 ms** | **15.02 ms** | **59.94 ms** | **92.67 ms** | **1,370** | Fail: drops only |
+| 17,000 | `pg_pipeline 0.2.3` | 16 | 16,831.7 | 9,638 | 0.945% | 50.14 ms | 36.80 ms | 129.20 ms | 203.65 ms | 2,718 | Fail: drops and p95 |
+| 17,000 | Direct `pg` | 32 | 14,088.5 | 158,696 | 15.558% | 334.33 ms | 308.36 ms | 600.62 ms | 850.50 ms | 5,000 | Fail: drops and latency |
 
-### Pipeline advantage at each offered load
+### `0.2.4` change relative to `0.2.3`
 
-| Target | RPS advantage | Fewer drops | p50 reduction | p95 reduction | p99 reduction |
-|---:|---:|---:|---:|---:|---:|
-| 15,000 | +1.5% | **92.4%** | **73.6%** | **82.2%** | **81.1%** |
-| 17,000 | +2.1% | **57.0%** | **42.2%** | **36.8%** | **~26.6%** |
-| 20,000 | **+17.2%** | **53.5%** | **18.1%** | **36.6%** | **5.6%** |
+| Target | RPS change | Fewer drops | Average reduction | p50 reduction | p95 reduction | p99 reduction | Max-VU reduction |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 15,000 | +0.16% | **53.8%** | **15.1%** | **18.8%** | **13.6%** | 2.4% | 6.9% |
+| 17,000 | +0.66% | **65.8%** | **57.0%** | **59.2%** | **53.6%** | **54.5%** | **49.6%** |
 
-The 15,000 RPS pipeline result missed only the dropped-iteration criterion: the
-threshold was below 15 drops/second, while the observed rate was approximately
-17 drops/second. The direct pool failed both latency and drop-rate criteria.
+At 15,000 RPS, `0.2.4` reduced dropped iterations below the selected 0.1% limit and
+was the only tested variant to pass the complete SLA. At 17,000 RPS, `0.2.4` still
+missed the drop-rate target, but retained acceptable p95 and p99 while `0.2.3` had
+already crossed its p95 limit. The direct pool reached the 5,000-VU ceiling at both
+targets and showed severe queue collapse.
 
-At 17,000 and 20,000 RPS, both systems reached the k6 virtual-user ceiling and were
-well beyond their sustainable SLA capacity. Those rows measure overload behavior,
-not sustainable production throughput.
+The open-loop result is the strongest practical evidence for the `0.2.4` completion
+change: the raw-RPS improvement is modest, but reducing the fixed per-request
+scheduler cost materially delayed backlog growth near saturation. Because each k6
+row is one run, the exact 53.8% and 65.8% drop reductions should be treated as the
+measured results of this harness, not universal guarantees.
 
-Each consolidated row is a single run. During the 17,000 RPS run, the direct pool
-reached 5,000 active VUs within roughly 3 seconds; the pipeline path reached that
-ceiling only around 42 seconds, illustrating slower queue collapse under overload.
+Earlier 20,000-RPS rows are no longer used in the primary release matrix because the
+final `0.2.4` A/B focused on longer, directly comparable 15,000- and 17,000-RPS runs.
 
-## 3. Low-load HTTP sanity check
+## 3. Low-load HTTP sanity check (historical `0.2.3`)
 
 At 1,000 fixed requests/sec, neither variant was meaningfully saturated:
 
@@ -148,11 +186,12 @@ At 1,000 fixed requests/sec, neither variant was meaningfully saturated:
 At low load the paths are effectively tied, as expected: there is little queueing and
 almost no local RTT to amortize.
 
-## 4. In-process A/B benchmark kit
+## 4. In-process A/B benchmark kit (historical `0.2.3`)
 
-The repository benchmark compares the pipeline client with a naive direct `pg` pool
-without HTTP/Rack/Falcon overhead. Workload: 500 concurrent fibers, 5 queries each,
-2,500 requests total, pipeline size 4, baseline pool 32.
+These repository benchmark-kit results were collected for `0.2.3` and are retained
+as historical in-process evidence. They compare the pipeline client with a naive
+direct `pg` pool without HTTP/Rack/Falcon overhead. Workload: 500 concurrent
+fibers, 5 queries each, 2,500 requests total, pipeline size 4, baseline pool 32.
 
 ### Unprepared SQL
 
@@ -253,8 +292,8 @@ between machines.
 
 They support the following practical claims:
 
-- `pg_pipeline` can deliver higher maximum HTTP throughput than a direct `pg` pool
-  in a highly concurrent Falcon workload.
+- `pg_pipeline 0.2.4` delivered higher maximum HTTP throughput than both `0.2.3`
+  and a direct `pg` pool in the measured highly concurrent Falcon workload.
 - It can do so with materially fewer PostgreSQL connections.
 - Its strongest and most consistent advantage is connection efficiency and lower
   queue/tail latency under concurrency and overload.
@@ -263,10 +302,10 @@ They support the following practical claims:
 
 They do **not** show that:
 
-- every application will gain 30% RPS;
+- every application will reproduce the observed 31.6% RPS advantage over direct `pg`;
 - pipeline mode makes a single PostgreSQL backend execute queries concurrently;
 - the local Mac/Docker figures are production capacity numbers;
-- one-run results are statistically stable medians;
+- the two-run `oha` means or single-run k6 rows are publication-grade statistical medians;
 - Ruby/Falcon can match the absolute throughput of native Rust HTTP stacks.
 
 For application-specific decisions, reproduce the benchmark with representative SQL,
