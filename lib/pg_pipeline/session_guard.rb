@@ -29,6 +29,11 @@ module PgPipeline
       "pg_export_snapshot" => /\bpg_export_snapshot\s*\(/i
     }.freeze
 
+    PATTERN_PREFILTER = /\binto\b/i
+    NEEDS_MASK = /['"]|--|\/\*|\$[A-Za-z_0-9]*\$/
+    LEADING_KEYWORD = /\A\s*([a-zA-Z_]+)/
+    WHITESPACE_BYTES = [9, 10, 11, 12, 13, 32].freeze
+
     def assert_multiplexable!(sql, mode: :default)
       assert_multiplexable_normalized!(sql, mode: normalize_mode!(mode))
     end
@@ -45,6 +50,7 @@ module PgPipeline
     end
 
     GUARD_CACHE_LIMIT = 2048
+    SAFE = :safe
 
     def unsafe_reason(sql, mode: :default)
       unsafe_reason_normalized(sql, mode: normalize_mode!(mode))
@@ -53,11 +59,12 @@ module PgPipeline
     def unsafe_reason_normalized(sql, mode:)
       key = sql.to_s
       cache = guard_cache.fetch(mode)
-      return cache[key] if cache.key?(key)
+      cached = cache[key]
+      return (cached.equal?(SAFE) ? nil : cached) if cached
 
       reason = compute_unsafe_reason(key, mode)
-      cache.clear if cache.size >= GUARD_CACHE_LIMIT
-      cache[key] = reason
+      cache.shift if cache.size >= GUARD_CACHE_LIMIT
+      cache[key] = reason || SAFE
       reason
     end
 
@@ -66,12 +73,13 @@ module PgPipeline
     end
 
     def compute_unsafe_reason(sql, mode)
-      code = code_only(sql)
-      lead = code[/\A\s*([a-zA-Z_]+)/, 1]&.downcase
+      code = NEEDS_MASK.match?(sql) ? code_only(sql) : sql
+      lead = code[LEADING_KEYWORD, 1]&.downcase
 
       return "empty" unless lead
       return "leading:#{lead}" unless ALLOWED_LEADING.include?(lead)
       return "multiple-statements" if multiple_statements?(code)
+      return nil unless code.include?("(") || code.match?(PATTERN_PREFILTER)
 
       FORBIDDEN_PATTERNS.each do |name, pattern|
         return name if code.match?(pattern)
@@ -95,47 +103,50 @@ module PgPipeline
 
     def code_only(sql)
       source = sql.to_s.b
-      output = String.new(capacity: source.bytesize, encoding: Encoding::BINARY)
+      size = source.bytesize
+      output = String.new(capacity: size, encoding: Encoding::BINARY)
       index = 0
       block_depth = 0
 
-      while index < source.bytesize
+      while index < size
+        byte = source.getbyte(index)
+        nxt = index + 1 < size ? source.getbyte(index + 1) : nil
+
         if block_depth.positive?
-          if source.byteslice(index, 2) == "/*"
+          if byte == 47 && nxt == 42
             block_depth += 1
             output << "  "
             index += 2
-          elsif source.byteslice(index, 2) == "*/"
+          elsif byte == 42 && nxt == 47
             block_depth -= 1
             output << "  "
             index += 2
           else
-            output << (source.getbyte(index) == 10 ? "\n" : " ")
+            output << (byte == 10 ? 10 : 32)
             index += 1
           end
           next
         end
 
-        if source.byteslice(index, 2) == "--"
+        if byte == 45 && nxt == 45
           newline = source.index("\n", index + 2)
           if newline
-            output << " " * (newline - index) << "\n"
+            output << (" " * (newline - index)) << "\n"
             index = newline + 1
           else
-            output << " " * (source.bytesize - index)
+            output << (" " * (size - index))
             break
           end
           next
         end
 
-        if source.byteslice(index, 2) == "/*"
+        if byte == 47 && nxt == 42
           block_depth = 1
           output << "  "
           index += 2
           next
         end
 
-        byte = source.getbyte(index)
         if byte == 39
           index = mask_quoted(source, output, index, 39, escape_backslash: escape_string_prefix?(source, index))
           next
@@ -147,18 +158,18 @@ module PgPipeline
         end
 
         if byte == 36
-          remainder = source.byteslice(index, source.bytesize - index)
+          remainder = source.byteslice(index, size - index)
           tag = remainder.match(/\A\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/)&.[](0)
           if tag
             closing = source.index(tag, index + tag.bytesize)
-            finish = closing ? closing + tag.bytesize : source.bytesize
-            output << " " * (finish - index)
+            finish = closing ? closing + tag.bytesize : size
+            output << (" " * (finish - index))
             index = finish
             next
           end
         end
 
-        output << source.getbyte(index)
+        output << byte
         index += 1
       end
 
@@ -209,12 +220,17 @@ module PgPipeline
     private_class_method :escape_string_prefix?
 
     def multiple_statements?(code)
-      semicolons = []
-      code.each_char.with_index { |char, i| semicolons << i if char == ";" }
-      return false if semicolons.empty?
+      first = code.index(";")
+      return false unless first
 
-      last_non_space = code.rstrip.length - 1
-      semicolons.length > 1 || semicolons.first != last_non_space
+      index = first + 1
+      size = code.bytesize
+      while index < size
+        return true unless WHITESPACE_BYTES.include?(code.getbyte(index))
+
+        index += 1
+      end
+      false
     end
   end
 end

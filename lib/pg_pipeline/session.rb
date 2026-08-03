@@ -4,6 +4,8 @@ require_relative "errors"
 
 module PgPipeline
   class Session
+    EMPTY_PARAMS = [].freeze
+
     attr_reader :owner_fiber
 
     def initialize(conn)
@@ -12,10 +14,10 @@ module PgPipeline
       @owner_fiber = Fiber.current
     end
 
-    def query(sql, params = []) = SessionOps.query(self, sql, params)
+    def query(sql, params = EMPTY_PARAMS) = SessionOps.query(self, sql, params)
     def exec(sql, params = nil) = SessionOps.exec(self, sql, params)
     def prepare(name, sql, param_types = nil) = SessionOps.prepare(self, name, sql, param_types)
-    def exec_prepared(name, params = []) = SessionOps.exec_prepared(self, name, params)
+    def exec_prepared(name, params = EMPTY_PARAMS) = SessionOps.exec_prepared(self, name, params)
     def active? = @active
 
     private

@@ -20,6 +20,16 @@ module PgPipeline
                   :draining, :needs_flush, :writer_armed, :request_event_pending,
                   :owner_task, :reader_task, :writer_task
 
+    attr_writer :readable_events, :results_read, :units_completed, :flush_calls,
+                :flush_incomplete, :dispatches
+
+    def readable_events = @readable_events || 0
+    def results_read = @results_read || 0
+    def units_completed = @units_completed || 0
+    def flush_calls = @flush_calls || 0
+    def flush_incomplete = @flush_incomplete || 0
+    def dispatches = @dispatches || 0
+
     def initialize(conn, max_pending: DEFAULT_MAX_PENDING, max_in_flight: DEFAULT_MAX_IN_FLIGHT)
       @max_pending = DriverOps.positive_integer!(max_pending, :max_pending)
       @max_in_flight = DriverOps.positive_integer!(max_in_flight, :max_in_flight)
@@ -27,6 +37,7 @@ module PgPipeline
       @conn = conn
       @caps = ServerCaps.from_connection(conn)
       @caps.assert_supported!
+      DriverOps.warn_flush_coupling_once(@caps)
 
       @requests = BoundedQueue.new(@max_pending)
       @events = Async::Queue.new
@@ -43,6 +54,13 @@ module PgPipeline
       @needs_flush = false
       @writer_armed = false
       @request_event_pending = false
+
+      @readable_events = 0
+      @results_read = 0
+      @units_completed = 0
+      @flush_calls = 0
+      @flush_incomplete = 0
+      @dispatches = 0
 
       @socket = nil
       @owner_task = nil
@@ -63,14 +81,24 @@ module PgPipeline
         pending: @requests.size,
         in_flight: @inflight.size,
         submitting: @submitting,
-        needs_flush: @needs_flush
+        needs_flush: @needs_flush,
+        fast_sync: @caps.fast_sync?,
+        readable_events: readable_events,
+        results_read: results_read,
+        units_completed: units_completed,
+        flush_calls: flush_calls,
+        flush_incomplete: flush_incomplete,
+        dispatches: dispatches,
+        units_per_readable: DriverOps.ratio(units_completed, readable_events),
+        results_per_readable: DriverOps.ratio(results_read, readable_events),
+        flush_calls_per_unit: DriverOps.ratio(flush_calls, units_completed)
       }
     end
 
     def health_check(timeout)
       return true unless available?
 
-      probe = Request.new(sql: "SELECT 1", params: [])
+      probe = Request.build("SELECT 1", nil)
       begin
         submit(probe)
         Async::Task.current.with_timeout(timeout) { probe.wait }
@@ -98,17 +126,25 @@ module PgPipeline
   module DriverOps
     module_function
 
-    SUCCESS_STATUSES = [
-      PG::PGRES_EMPTY_QUERY,
-      PG::PGRES_COMMAND_OK,
-      PG::PGRES_TUPLES_OK
-    ].freeze
+    def ratio(numerator, denominator)
+      return 0.0 if denominator.zero?
 
-    COPY_STATUSES = [
-      PG::PGRES_COPY_IN,
-      PG::PGRES_COPY_OUT,
-      PG::PGRES_COPY_BOTH
-    ].freeze
+      (numerator.to_f / denominator).round(3)
+    end
+
+    def warn_flush_coupling_once(caps)
+      return if @flush_coupling_warned
+      return if caps.fast_sync?
+      return if ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+
+      @flush_coupling_warned = true
+      warn(
+        "pg_pipeline: libpq #{caps.libpq_version} couples pipeline Sync with flush " \
+        "(no PQsendPipelineSync). Queries still pipeline and still amortise RTT, but " \
+        "one flush per unit caps local throughput; libpq >= 17 is recommended for " \
+        "maximum throughput. Set PG_PIPELINE_SILENCE_WARNINGS=1 to silence this."
+      )
+    end
 
     def positive_integer!(value, name)
       integer = Integer(value)
@@ -213,6 +249,7 @@ module PgPipeline
         nil
       when :readable
         begin
+          d.readable_events += 1
           read_available(d)
           input_changed = true
         ensure
@@ -260,6 +297,7 @@ module PgPipeline
         request.dispatched!
         d.inflight << request
         d.dispatching = nil
+        d.dispatches += 1
         dispatched = true
       end
 
@@ -286,9 +324,6 @@ module PgPipeline
       rescue ProtocolError
         raise
       rescue StandardError => e
-        # ruby-pg prepares/encodes query parameters before calling PQsend*. A
-        # Ruby-side encoder/coercion exception therefore belongs only to this
-        # request and must not poison unrelated work already in the pipeline.
         request.reject!(e)
         return false
       end
@@ -327,10 +362,13 @@ module PgPipeline
     def flush_output(d)
       return unless d.running
 
+      d.flush_calls += 1
+
       if d.conn.sync_flush
         d.needs_flush = false
       else
         d.needs_flush = true
+        d.flush_incomplete += 1
         arm_writer(d)
       end
     rescue PG::Error => e
@@ -351,42 +389,52 @@ module PgPipeline
     end
 
     def drain_results(d)
-      while !d.inflight.empty? && !d.conn.is_busy
-        result = d.conn.sync_get_result
-        request = d.inflight.first
-        raise ProtocolError, "result without an in-flight request" unless request
+      read = 0
 
-        if result.nil?
-          request.query_boundary!
-          next
+      begin
+        while !d.inflight.empty? && !d.conn.is_busy
+          result = d.conn.sync_get_result
+          read += 1
+          request = d.inflight.first
+          raise ProtocolError, "result without an in-flight request" unless request
+
+          if result.nil?
+            request.query_boundary!
+            next
+          end
+
+          status = result.result_status
+
+          case status
+          when PG::PGRES_TUPLES_OK
+            ensure_before_query_boundary!(request, status)
+            request.accept_result(result)
+          when PG::PGRES_PIPELINE_SYNC
+            clear_result(result)
+            complete_front(d, request)
+          when PG::PGRES_COMMAND_OK, PG::PGRES_EMPTY_QUERY
+            ensure_before_query_boundary!(request, status)
+            request.accept_result(result)
+          when PG::PGRES_FATAL_ERROR
+            ensure_before_query_boundary!(request, status)
+            request.record_error!(query_error(result), result: result)
+          when PG::PGRES_PIPELINE_ABORTED
+            ensure_before_query_boundary!(request, status)
+            clear_result(result)
+            request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
+          when PG::PGRES_BAD_RESPONSE
+            clear_result(result)
+            raise ProtocolError, "server response was not understood"
+          when PG::PGRES_COPY_IN, PG::PGRES_COPY_OUT, PG::PGRES_COPY_BOTH
+            clear_result(result)
+            raise ProtocolError, "COPY is not supported on the multiplexed pipeline"
+          else
+            clear_result(result)
+            raise ProtocolError, "unexpected pipeline result status #{status}"
+          end
         end
-
-        status = result.result_status
-
-        case status
-        when PG::PGRES_PIPELINE_SYNC
-          clear_result(result)
-          complete_front(d, request)
-        when PG::PGRES_PIPELINE_ABORTED
-          ensure_before_query_boundary!(request, status)
-          clear_result(result)
-          request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
-        when PG::PGRES_BAD_RESPONSE
-          clear_result(result)
-          raise ProtocolError, "server response was not understood"
-        when PG::PGRES_FATAL_ERROR
-          ensure_before_query_boundary!(request, status)
-          request.record_error!(query_error(result), result: result)
-        when *COPY_STATUSES
-          clear_result(result)
-          raise ProtocolError, "COPY is not supported on the multiplexed pipeline"
-        when *SUCCESS_STATUSES
-          ensure_before_query_boundary!(request, status)
-          request.accept_result(result)
-        else
-          clear_result(result)
-          raise ProtocolError, "unexpected pipeline result status #{status}"
-        end
+      ensure
+        d.results_read += read if read.positive?
       end
     end
 
@@ -400,6 +448,7 @@ module PgPipeline
       raise ProtocolError, "sync does not match FIFO front" unless request.equal?(d.inflight.first)
 
       d.inflight.shift
+      d.units_completed += 1
       request.finish!
     end
 

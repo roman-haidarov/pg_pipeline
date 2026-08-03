@@ -22,10 +22,16 @@ module PgPipeline
       @waiter_scheduler = nil
     end
 
+    def self.build(sql, params)
+      request = allocate
+      request.__send__(:init_query, sql, params)
+      request
+    end
+
     def self.prepare(statement) = PrepareRequest.new(statement)
 
     def self.prepared_query(statement, params: nil)
-      PreparedQueryRequest.new(statement, params: params)
+      PreparedQueryRequest.build(statement, params)
     end
 
     def operation = :query
@@ -43,6 +49,23 @@ module PgPipeline
     def query_boundary_seen? = @query_boundary_seen
     def cancelled? = @cancelled
     def settled? = @settled
+
+    private
+
+    def init_query(sql, params)
+      @sql = RequestOps.snapshot_sql(sql)
+      @params = RequestOps.snapshot_params(params)
+      @state = :new
+      @cancelled = false
+      @settled = false
+      @result_seen = false
+      @query_boundary_seen = false
+      @result = nil
+      @error = nil
+      @waiter = nil
+      @waiter_scheduler = nil
+      self
+    end
   end
 
   class PrepareRequest < Request
@@ -65,7 +88,21 @@ module PgPipeline
       @statement_name = RequestOps.snapshot_name(statement.physical_name)
     end
 
+    def self.build(statement, params)
+      request = allocate
+      request.__send__(:init_prepared, statement, params)
+      request
+    end
+
     def operation = :prepared_query
+
+    private
+
+    def init_prepared(statement, params)
+      init_query(statement.sql, params)
+      @statement_name = RequestOps.snapshot_name(statement.physical_name)
+      self
+    end
   end
 
   module RequestOps
@@ -76,11 +113,34 @@ module PgPipeline
       value.frozen? ? value : value.dup.freeze
     end
 
-    def snapshot_params(params)
-      values = params.nil? ? [] : params
-      raise ArgumentError, "params must be an Array" unless values.is_a?(Array)
+    EMPTY_PARAMS = [].freeze
 
-      values.map { |value| snapshot_value(value) }.freeze
+    def snapshot_params(params)
+      return EMPTY_PARAMS if params.nil?
+      raise ArgumentError, "params must be an Array" unless params.is_a?(Array)
+      return EMPTY_PARAMS if params.empty?
+
+      return params if params.frozen? && immutable_values?(params)
+
+      params.map { |value| snapshot_value(value) }.freeze
+    end
+
+    def immutable_values?(values)
+      index = 0
+      size = values.size
+      while index < size
+        value = values[index]
+        case value
+        when Integer, Float, Symbol, NilClass, TrueClass, FalseClass
+          nil
+        when String
+          return false unless value.frozen?
+        else
+          return false
+        end
+        index += 1
+      end
+      true
     end
 
     def snapshot_value(value)

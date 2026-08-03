@@ -16,7 +16,7 @@ module PgPipeline
       freeze
     end
 
-    def query(params = []) = PreparedStatementOps.query(self, params)
+    def query(params = RequestOps::EMPTY_PARAMS) = PreparedStatementOps.query(self, params)
     alias call query
 
     def inspect

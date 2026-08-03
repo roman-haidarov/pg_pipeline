@@ -40,6 +40,14 @@ gem "pg_pipeline"
 
 Requires Ruby ≥ 3.3, `async ~> 2.42`, `pg ≥ 1.5`, and **libpq ≥ 14** at runtime.
 
+**libpq ≥ 17 is recommended for maximum local throughput.** Below 17 there is no
+`PQsendPipelineSync`, so `PQpipelineSync` couples Sync with a flush and the driver
+cannot batch writes across a dispatch burst. Correctness is identical and RTT
+amortisation — the main reason to pipeline — still works on libpq 14; only local
+throughput is capped. The driver detects this at connect time and warns once per
+process; set `PG_PIPELINE_SILENCE_WARNINGS=1` to suppress it, and check
+`db.stats[:pipeline][:drivers].first[:fast_sync]` to see which path is active.
+
 ## Usage
 
 ### Multiplexed queries
@@ -154,6 +162,49 @@ db.stats
 ```
 
 `load` (pending + in-flight + submitting + dispatching) per driver is the routing/head-of-line signal.
+
+Each driver also reports how well the pipeline is filling:
+
+```ruby
+db.stats[:pipeline][:drivers].first
+# => { ..., fast_sync: true,
+#      units_per_readable: 7.9, results_per_readable: 22.2,
+#      flush_calls_per_unit: 0.17, flush_incomplete: 0 }
+```
+
+`units_per_readable` is the number to watch. Around `1.0` means every query pays a
+full socket wait plus scheduler round trip and the pipeline is not filling — that is
+the expected shape for a single fiber issuing one query at a time, and no amount of
+Ruby-side optimisation will change it. Values well above `1.0` mean one reactor
+wakeup is amortised over many queries, which is the regime pipelining is for. Check
+this before attributing a throughput number to control-plane cost.
+
+The numbers above are from a saturated HTTP benchmark (4 workers, 4 connections
+each, ~20k requests/second against a local server): roughly eight queries per
+reactor wakeup and one flush per six queries. `results_per_readable` runs at
+three times `units_per_readable` because a completed unit yields three protocol
+results -- the data, the query boundary and the Sync.
+
+## Head-of-line blocking
+
+Results on a pipelined connection arrive in FIFO order, and PostgreSQL offers no
+safe way to cancel one request out of a multiplexed pipeline (see `DESIGN.md` §7).
+Two consequences worth designing around:
+
+- **A slow query delays everything behind it on the same connection.** With the
+  default `max_in_flight: 64`, one multi-second query can hold up to 63 unrelated
+  queries on that driver. Driver selection balances by queue depth, not by expected
+  cost, so a slow query counts the same as a fast one.
+- **A timeout is not a cancellation.** Wrapping `db.query` in `with_timeout` returns
+  control to your fiber, but the unit stays in the pipeline until the server answers
+  it, and the requests behind it still wait.
+
+If your workload mixes fast and slow queries, prefer one of:
+
+- lower `max_in_flight` so a stall cannot capture a deep queue;
+- a second `Client` with its own connections for the slow queries;
+- `Client#session` for anything long-running, which uses an exclusive pinned
+  connection and cannot block multiplexed traffic.
 
 ## Failure model
 
