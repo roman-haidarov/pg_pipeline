@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.2.5] - 2026-08-03
+
+Control-plane cleanup on the multiplexed query path: fewer per-query allocations,
+a cheaper session-guard fast path, slightly tighter result drain, and driver
+fill metrics. Wire behaviour and the public API are unchanged.
+
+### Performance
+
+- `SessionGuard` skips comment/literal masking when the SQL has no quotes,
+  comments or dollar-quotes; skips the forbidden-pattern scan when the SQL has
+  neither `(` nor `into`; and uses a byte scan for multi-statement detection.
+- `Request.build` / `PreparedQueryRequest.build` avoid keyword `Class#new` hash
+  allocation on the hot path.
+- `RequestOps.snapshot_params` reuses a shared frozen empty array and skips
+  copying frozen immutable param arrays.
+- Default query params use that empty frozen array instead of allocating `[]`
+  per call (`Client`, `Session`, `PreparedStatement`).
+- `PoolOps.select_driver_into` writes the round-robin cursor into a pool-owned
+  slot instead of allocating a `[driver, cursor]` pair per selection.
+- `drain_results` matches hot statuses (`TUPLES_OK`, `PIPELINE_SYNC`) first and
+  accumulates `results_read` once per drain.
+
+### Observability
+
+- Driver stats add `fast_sync`, `units_per_readable`, `results_per_readable`,
+  `flush_calls`, `flush_incomplete`, `dispatches`, and `flush_calls_per_unit`.
+- One process-level warning on libpq older than 17 when Sync is coupled to flush
+  (`PG_PIPELINE_SILENCE_WARNINGS=1` to suppress).
+
+### Reliability
+
+- Round-robin cursor is normalised with `rr % size` when past the pool length.
+- Driver metric readers default to zero if ivars are unset.
+
+### Tests
+
+- Guard fast-path / masking / cache eviction coverage.
+- `Request.build` equivalence and prepared-query build coverage.
+- Randomised driver-selection vs reference algorithm.
+- Drain counter write-back when the loop raises.
+
 ## [0.2.4] - 2026-07-31
 
 Request-completion allocation patch. It replaces the general-purpose

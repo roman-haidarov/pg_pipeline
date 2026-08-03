@@ -192,4 +192,46 @@ RSpec.describe PgPipeline::Request do
     expect(request.param_types).to eq([23, nil])
     expect(request.param_types).to be_frozen
   end
+
+  describe ".build / snapshot_params" do
+    it "builds a query request without keyword-argument allocation on the hot path" do
+      sql = "SELECT $1::int AS n".freeze
+      params = [1].freeze
+      request = described_class.build(sql, params)
+
+      expect(request.sql).to equal(sql)
+      expect(request.params).to equal(params)
+      expect(request.state).to eq(:new)
+      expect(request.settled?).to be(false)
+      expect(request.cancelled?).to be(false)
+      expect(request.operation).to eq(:query)
+    end
+
+    it "maps nil and empty params to the shared EMPTY_PARAMS constant" do
+      empty = PgPipeline::RequestOps::EMPTY_PARAMS
+
+      expect(PgPipeline::RequestOps.snapshot_params(nil)).to equal(empty)
+      expect(PgPipeline::RequestOps.snapshot_params([])).to equal(empty)
+      expect(described_class.build("SELECT 1".freeze, nil).params).to equal(empty)
+    end
+
+    it "reuses a frozen array of immutable values without copying" do
+      params = [1, "x".freeze, nil, true, :sym].freeze
+
+      expect(PgPipeline::RequestOps.snapshot_params(params)).to equal(params)
+    end
+
+    it "still snapshots mutable string params so callers cannot race the wire" do
+      string = +"one"
+      params = [string]
+      request = described_class.build("SELECT $1".freeze, params)
+
+      string.replace("changed")
+      params << "two"
+
+      expect(request.params).to eq(["one"])
+      expect(request.params).to be_frozen
+      expect(request.params[0]).to be_frozen
+    end
+  end
 end

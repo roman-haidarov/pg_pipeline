@@ -182,7 +182,6 @@ RSpec.describe PgPipeline::Pool do
         pool.send(:supervise)
 
         expect(calls).to be >= 2
-        # Second successful iteration clears the transient supervisor_error.
         expect(pool.stats[:supervisor_error]).to be_nil
       end
     end
@@ -574,6 +573,27 @@ RSpec.describe PgPipeline::Pool do
       third, = PgPipeline::PoolOps.select_driver(drivers, rr)
 
       expect([first, second, third]).to eq(drivers)
+    end
+
+    it "keeps select_driver_into equivalent to select_driver without allocating a result tuple" do
+      fake = Struct.new(:available, :loadv) do
+        def available? = available
+        def load = loadv
+      end
+
+      srand(7)
+      200.times do
+        size = rand(0..5)
+        drivers = Array.new(size) { fake.new([true, true, false].sample, rand(0..9)) }
+        rr = size.zero? ? 0 : rand(0...size)
+
+        expected_driver, expected_rr = PgPipeline::PoolOps.select_driver(drivers, rr)
+        slot = [0]
+        actual_driver = PgPipeline::PoolOps.select_driver_into(drivers, rr, slot)
+
+        expect(actual_driver).to equal(expected_driver)
+        expect(slot[0]).to eq(expected_rr)
+      end
     end
   end
 

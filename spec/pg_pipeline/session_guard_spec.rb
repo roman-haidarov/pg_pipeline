@@ -34,6 +34,8 @@ RSpec.describe PgPipeline::SessionGuard do
       "SELECT * INTO pg_temp.t FROM users" => "select-into-pg-temp",
       "SELECT * INTO TABLE pg_temp_3.t FROM users" => "select-into-pg-temp",
       "SELECT 1; SELECT 2" => "multiple-statements",
+      "SELECT 1;  " => nil,
+      "SELECT 1;\t\n" => nil,
       "" => "empty"
     }.each do |sql, expected|
       it "classifies #{sql.inspect}" do
@@ -45,6 +47,33 @@ RSpec.describe PgPipeline::SessionGuard do
   it "raises with the pinned-session guidance for rejected SQL" do
     expect { described_class.assert_multiplexable!("SET timezone = 'UTC'") }
       .to raise_error(PgPipeline::UnsafeMultiplexError, /Client#session/)
+  end
+
+  describe "optimized classification path" do
+    it "treats parameterized SQL without quotes or comments as session-neutral" do
+      sql = "SELECT id, name FROM users WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT 50"
+
+      expect(described_class.unsafe_reason(sql)).to be_nil
+      expect(described_class.compute_unsafe_reason(sql, :default)).to be_nil
+    end
+
+    it "still masks quoted and commented hazards before classification" do
+      expect(described_class.unsafe_reason("SELECT 1 -- ;\n")).to be_nil
+      expect(described_class.unsafe_reason("SELECT $$; SELECT 2$$")).to be_nil
+      expect(described_class.unsafe_reason("SELECT 1 /* ; */")).to be_nil
+    end
+
+    it "caches safe results without allocating a new reason string each hit" do
+      sql = "SELECT $1::int AS n"
+      described_class.guard_cache[:default].clear
+
+      first = described_class.unsafe_reason_normalized(sql, mode: :default)
+      second = described_class.unsafe_reason_normalized(sql, mode: :default)
+
+      expect(first).to be_nil
+      expect(second).to be_nil
+      expect(described_class.guard_cache[:default][sql]).to eq(described_class::SAFE)
+    end
   end
 
   describe ".normalize_mode!" do

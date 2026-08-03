@@ -240,6 +240,46 @@ that the request-specific one-shot waiter deliberately does not provide.
 > suite against the exact 2.42.0 floor so `Scheduler#block`/`#unblock` behavior is
 > not merely assumed from a broad pessimistic dependency range.
 
+## 10a. Guard evaluation shape
+
+`SessionGuard` validates the session-neutral SQL contract of §6 before a query is
+allowed onto the shared path, so its cost lands on the reactor thread and its
+stalls are visible in every other fiber's latency, not just the caller's.
+
+Evaluation is therefore staged so that the expensive stage runs only when it can
+change the answer:
+
+1. **Masking is skipped when it is provably an identity transform.** `code_only`
+   blanks string literals, quoted identifiers, comments and dollar-quoted bodies.
+   If none of `'`, `"`, `--`, `/*` or a `$tag$` delimiter appears in the SQL,
+   there is nothing to blank and the raw SQL is validated directly.
+2. **The forbidden-pattern scan is skipped when no pattern can match.** Every
+   pattern in `FORBIDDEN_PATTERNS` and `STRICT_FORBIDDEN` is anchored on either a
+   parenthesis or the word `into`, so SQL containing neither cannot match any of
+   them.
+3. **Verdicts are cached by SQL string**, and the cache evicts a single oldest
+   entry at its limit. Clearing the whole cache would turn one insertion into a
+   full recompute for every subsequent statement.
+
+Stage 1 and stage 2 are correctness-preserving only as long as their premises
+hold. Both are asserted in `spec/pg_pipeline/session_guard_fast_path_spec.rb`;
+**adding a pattern that is not anchored on `(` or `into` requires updating the
+prefilter in the same change.**
+
+Masking is deliberately monotone in the wrong direction to be reordered: blanking
+a comment can *create* a match (`nextval/* c */('s')` becomes `nextval      ('s')`),
+so the raw SQL can never be used as a negative filter for stage 2. Only the
+absence of maskable syntax justifies skipping stage 1.
+
+## 10b. Fill observability
+
+Pipelining pays off only when one reactor wakeup is amortised over several units.
+`ConnectionDriver#stats` therefore reports `units_per_readable` (and related
+counters) alongside the queue depths. A value near 1.0 means each query costs a
+full socket wait and a scheduler round trip, which bounds throughput
+independently of control-plane work; values well above 1.0 mean the pipeline is
+filling. Read this number before attributing throughput to Ruby-side cost.
+
 ## 11. Version policy
 
 | Component | Minimum | Reason |

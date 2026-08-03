@@ -27,7 +27,7 @@ module PgPipeline
     end
 
     def start(parent: Async::Task.current) = ClientOps.start(self, parent)
-    def query(sql, params = []) = ClientOps.query(self, sql, params)
+    def query(sql, params = RequestOps::EMPTY_PARAMS) = ClientOps.query(self, sql, params)
     def prepare(name, sql, param_types = nil) = ClientOps.prepare(self, name, sql, param_types)
     def stats = ClientOps.stats(self)
 
@@ -77,7 +77,7 @@ module PgPipeline
       SessionGuard.assert_multiplexable_normalized!(sql, mode: client.guard)
 
       wait_for_request do
-        submit_with_failover(client) { Request.new(sql: sql, params: params) }
+        submit_with_failover(client) { Request.build(sql, params) }
       end
     end
 
@@ -105,8 +105,6 @@ module PgPipeline
       end
     end
 
-    # NotDispatchedError is safe to retry on a fresh Request by contract.
-    # ShutdownError is retried only while the current Request is still pre-dispatch.
     def submit_with_failover(client)
       attempts = 0
       limit = [pool(client).pipeline_size, 1].max

@@ -53,6 +53,7 @@ module PgPipeline
       @driver_attempts = []
       @driver_last_health = []
       @rr = 0
+      @rr_slot = [0]
       @reconnects = 0
       @health_failures = 0
       @supervisor_error = nil
@@ -106,7 +107,8 @@ module PgPipeline
     def pipeline_driver
       ensure_available!
 
-      driver, @rr = PoolOps.select_driver(@drivers, @rr)
+      driver = PoolOps.select_driver_into(@drivers, @rr, @rr_slot)
+      @rr = @rr_slot[0]
       raise NotDispatchedError, "no live pipeline connections; request was not dispatched" unless driver
 
       driver
@@ -557,28 +559,42 @@ module PgPipeline
       raise ArgumentError, "#{name} must be an integer >= 0"
     end
 
-    def select_driver(drivers, rr)
+    def select_driver_into(drivers, rr, slot)
       size = drivers.length
-      return [nil, rr] if size.zero?
+      if size.zero?
+        slot[0] = rr
+        return nil
+      end
 
+      start = rr % size
       best = nil
-      best_index = nil
-      best_load = nil
+      best_index = 0
+      best_load = 0
+      offset = 0
 
-      size.times do |offset|
-        index = (rr + offset) % size
+      while offset < size
+        index = start + offset
+        index -= size if index >= size
         driver = drivers[index]
+        offset += 1
         next unless driver.available?
 
         load = driver.load
-        if best.nil? || load < best_load
-          best = driver
-          best_index = index
-          best_load = load
-        end
+        next unless best.nil? || load < best_load
+
+        best = driver
+        best_index = index
+        best_load = load
       end
 
-      best ? [best, (best_index + 1) % size] : [nil, rr]
+      slot[0] = best ? (best_index + 1) % size : rr
+      best
+    end
+
+    def select_driver(drivers, rr)
+      slot = [rr]
+      driver = select_driver_into(drivers, rr, slot)
+      [driver, slot[0]]
     end
 
     def new_connection(connection_args)
