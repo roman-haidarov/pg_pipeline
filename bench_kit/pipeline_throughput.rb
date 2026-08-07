@@ -18,8 +18,7 @@ puts "url=#{BenchKit.redact_url(url)} fibers=#{fibers} pipeline_size=#{pipeline}
 puts
 
 Sync do |task|
-  client = PgPipeline::Client.new(url, pipeline_size: pipeline, pinned_size: 1, health_check: false)
-    .start(parent: task)
+  client = PgPipeline::Client.new(url, pipeline_size: pipeline, pinned_size: 1, health_check: false).start
   statement = client.prepare("bench_throughput", sql) if prepared
   latencies = Array.new(fibers)
   t0 = BenchKit.now

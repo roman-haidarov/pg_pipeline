@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require "pg_pipeline"
 
 RSpec.configure do |config|

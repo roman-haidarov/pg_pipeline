@@ -42,14 +42,11 @@ worker_script = <<~'RUBY'
       pipeline_size: pipeline,
       pinned_size: pinned,
       health_check: false
-    ).start(parent: task)
-    begin
-      8.times.map { task.async { client.query("SELECT pg_sleep(0.05)") } }.each(&:wait)
-      client.transaction { |tx| tx.query("SELECT 1") } if pinned.positive?
-      sleep hold_s
-    ensure
-      client.close
-    end
+    ).start
+    8.times.map { task.async { client.query("SELECT pg_sleep(0.05)") } }.each(&:wait)
+    client.transaction { |tx| tx.query("SELECT 1") } if pinned.positive?
+    sleep hold_s
+    client.close
   end
 RUBY
 

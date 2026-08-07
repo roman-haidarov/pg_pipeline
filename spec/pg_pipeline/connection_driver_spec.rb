@@ -317,32 +317,129 @@ RSpec.describe PgPipeline::ConnectionDriver do
     end
   end
 
-  it "stops both watcher tasks even when the first stop raises" do
+  it "closes wait points and socket_io before stopping watchers so IO waits unblock" do
     driver = described_class.allocate
-    reader = instance_double(Async::Task)
-    writer = instance_double(Async::Task)
+    reader = instance_double(PgPipeline::Runtime::Task, stop: true, wait: nil)
+    writer = instance_double(PgPipeline::Runtime::Task, stop: true, wait: nil)
+    socket = instance_double(IO)
+    rearm = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    commands = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    events = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    conn = instance_double("PG::Connection", finished?: true)
     driver.instance_variable_set(:@reader_task, reader)
     driver.instance_variable_set(:@writer_task, writer)
+    driver.instance_variable_set(:@reader_rearm, rearm)
+    driver.instance_variable_set(:@writer_commands, commands)
+    driver.instance_variable_set(:@events, events)
+    driver.instance_variable_set(:@conn, conn)
+    driver.instance_variable_set(:@socket, socket)
+    driver.instance_variable_set(:@leaked_watchers, 0)
 
-    allow(reader).to receive(:stop).and_raise(RuntimeError, "reader failed")
-    expect(writer).to receive(:stop)
+    expect(rearm).to receive(:close).ordered
+    expect(commands).to receive(:close).ordered
+    expect(events).to receive(:close).ordered
+    expect(socket).to receive(:close).ordered
+    expect(reader).to receive(:stop).ordered
+    expect(writer).to receive(:stop).ordered
+    expect(conn).not_to receive(:close) # finished? true → safe_close_conn no-ops
 
-    expect { PgPipeline::DriverOps.stop_watchers(driver) }.not_to raise_error
+    PgPipeline::DriverOps.teardown_watchers(driver)
+    expect(driver.socket).to be_nil
+  end
+
+  it "joins both watcher tasks even when the first wait raises" do
+    driver = described_class.allocate
+    reader = instance_double(PgPipeline::Runtime::Task, stop: true)
+    writer = instance_double(PgPipeline::Runtime::Task, stop: true)
+    rearm = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    commands = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    events = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    conn = instance_double("PG::Connection", finished?: true)
+    driver.instance_variable_set(:@reader_task, reader)
+    driver.instance_variable_set(:@writer_task, writer)
+    driver.instance_variable_set(:@reader_rearm, rearm)
+    driver.instance_variable_set(:@writer_commands, commands)
+    driver.instance_variable_set(:@events, events)
+    driver.instance_variable_set(:@conn, conn)
+    driver.instance_variable_set(:@leaked_watchers, 0)
+
+    allow(reader).to receive(:wait).and_raise(RuntimeError, "reader failed")
+    expect(writer).to receive(:wait).with(PgPipeline::DriverOps::WATCHER_JOIN_TIMEOUT)
+
+    expect { PgPipeline::DriverOps.teardown_watchers(driver) }.not_to raise_error
     expect(driver.reader_task).to be_nil
     expect(driver.writer_task).to be_nil
   end
 
-  it "still stops the second watcher when the first stop raises Async::Cancel" do
+  it "still joins the second watcher when the first wait raises Runtime::Cancel" do
     driver = described_class.allocate
-    reader = instance_double(Async::Task)
-    writer = instance_double(Async::Task)
+    reader = instance_double(PgPipeline::Runtime::Task, stop: true)
+    writer = instance_double(PgPipeline::Runtime::Task, stop: true)
+    rearm = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    commands = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    events = instance_double(PgPipeline::Runtime::Queue, close: nil)
+    conn = instance_double("PG::Connection", finished?: true)
     driver.instance_variable_set(:@reader_task, reader)
     driver.instance_variable_set(:@writer_task, writer)
+    driver.instance_variable_set(:@reader_rearm, rearm)
+    driver.instance_variable_set(:@writer_commands, commands)
+    driver.instance_variable_set(:@events, events)
+    driver.instance_variable_set(:@conn, conn)
+    driver.instance_variable_set(:@leaked_watchers, 0)
 
-    allow(reader).to receive(:stop).and_raise(Async::Cancel.new("cancelled"))
-    expect(writer).to receive(:stop)
+    allow(reader).to receive(:wait).and_raise(PgPipeline::Runtime::Cancel.new("cancelled"))
+    expect(writer).to receive(:wait).with(PgPipeline::DriverOps::WATCHER_JOIN_TIMEOUT)
 
-    expect { PgPipeline::DriverOps.stop_watchers(driver) }.not_to raise_error
+    expect { PgPipeline::DriverOps.teardown_watchers(driver) }.not_to raise_error
+  end
+
+  it "joins the owner after a failed start tears down watchers" do
+    driver = described_class.allocate
+    owner = instance_double(PgPipeline::Runtime::Task, fiber: Object.new, name: :owner)
+    driver.instance_variable_set(:@running, false)
+    driver.instance_variable_set(:@accepting, false)
+    driver.instance_variable_set(:@owner_task, owner)
+    driver.instance_variable_set(:@reader_task, nil)
+    driver.instance_variable_set(:@writer_task, nil)
+    driver.instance_variable_set(:@reader_rearm, instance_double(PgPipeline::Runtime::Queue, close: nil))
+    driver.instance_variable_set(:@writer_commands, instance_double(PgPipeline::Runtime::Queue, close: nil))
+    driver.instance_variable_set(:@events, instance_double(PgPipeline::Runtime::Queue, close: nil))
+    driver.instance_variable_set(:@conn, instance_double("PG::Connection", finished?: true))
+    driver.instance_variable_set(:@leaked_watchers, 0)
+
+    expect(owner).to receive(:wait).with(PgPipeline::DriverOps::OWNER_JOIN_TIMEOUT)
+
+    # Simulate the start rescue path: watchers already torn down, owner still set.
+    PgPipeline::DriverOps.teardown_watchers(driver)
+    PgPipeline::DriverOps.join_owner(driver)
+  end
+
+  it "reports the owner join timeout in leak warnings" do
+    driver = described_class.allocate
+    driver.instance_variable_set(:@leaked_watchers, 1)
+    task = instance_double(PgPipeline::Runtime::Task, name: :owner)
+
+    expect {
+      PgPipeline::DriverOps.warn_leaked_task(driver, task, PgPipeline::DriverOps::OWNER_JOIN_TIMEOUT)
+    }.to output(/task :owner.*#{PgPipeline::DriverOps::OWNER_JOIN_TIMEOUT}s/).to_stderr
+  end
+
+  it "does not call wait on a nil owner_task during abort!" do
+    driver = described_class.allocate
+    driver.instance_variable_set(:@running, true)
+    driver.instance_variable_set(:@accepting, true)
+    driver.instance_variable_set(:@owner_task, nil)
+    driver.instance_variable_set(
+      :@requests,
+      instance_double(PgPipeline::BoundedQueue, close: nil)
+    )
+    driver.instance_variable_set(
+      :@events,
+      instance_double(PgPipeline::Runtime::Queue, enqueue: nil)
+    )
+
+    expect { PgPipeline::DriverOps.abort!(driver, PgPipeline::ConnectionLostError.new("gone")) }
+      .not_to raise_error
   end
 
   describe ".process_event" do
@@ -352,8 +449,8 @@ RSpec.describe PgPipeline::ConnectionDriver do
       driver.instance_variable_set(:@inflight, inflight)
       driver.instance_variable_set(:@max_in_flight, inflight.length)
       driver.instance_variable_set(:@requests, instance_double(PgPipeline::BoundedQueue, empty?: true))
-      driver.instance_variable_set(:@reader_rearm, instance_double(Async::Queue, enqueue: nil))
-      driver.instance_variable_set(:@writer_commands, instance_double(Async::Queue, enqueue: nil))
+      driver.instance_variable_set(:@reader_rearm, instance_double(PgPipeline::Runtime::Queue, enqueue: nil))
+      driver.instance_variable_set(:@writer_commands, instance_double(PgPipeline::Runtime::Queue, enqueue: nil))
       driver.instance_variable_set(:@running, true)
       driver.instance_variable_set(:@draining, false)
       driver.instance_variable_set(:@needs_flush, false)

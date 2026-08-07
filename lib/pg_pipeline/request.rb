@@ -255,13 +255,11 @@ module PgPipeline
       req.waiter = waiter
       req.waiter_scheduler = scheduler
 
-      begin
-        scheduler.block(req, nil) until req.settled
-      ensure
-        if req.waiter.equal?(waiter)
-          req.waiter = nil
-          req.waiter_scheduler = nil
-        end
+      scheduler.block(req, nil) until req.settled
+    ensure
+      if waiter && req.waiter.equal?(waiter)
+        req.waiter = nil
+        req.waiter_scheduler = nil
       end
     end
 

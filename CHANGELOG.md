@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.3.0] - 2026-08-07
+
+Scheduler-agnostic control plane: the gem no longer depends on the `async` gem
+at runtime. Any `Fiber::Scheduler` host works (Async::Scheduler, Itsi::Scheduler,
+or another `Fiber.set_scheduler` implementation).
+
+### Changed
+
+- New `PgPipeline::Runtime` primitives (`Notification`, `Queue`, `Semaphore`,
+  `Task`, `spawn`, `with_timeout`, `Cancel`) built on `Fiber.scheduler`.
+- Driver/pool background work uses `Runtime.spawn` instead of `parent.async`.
+- Pinned-connection ownership keys on `Fiber.current` (not `Async::Task.current`).
+- Watcher shutdown closes queues + connection, then joins tasks with a timeout.
+- Timeouts go through `Timeout.timeout` (correct `timeout_after` arity), never a
+  direct one-arg `scheduler.timeout_after` call.
+- Closed `Runtime::Queue#enqueue` is a no-op; supervisor sleep errors are recorded
+  and `stats` exposes `supervisor_alive`.
+- `Client#start` / `Pool#start` / `ConnectionDriver#start` no longer take
+  `parent:` (no Async task-tree ownership; use `Runtime.spawn` on the active
+  scheduler). Call sites that passed `start(parent: task)` should use `#start`.
+- Runtime dependency: only `pg`. `async` is a development dependency for the
+  existing Async-based test harness.
+
+### Migration
+
+Hosts must install a Fiber scheduler before `Client#start`. Under Async:
+
+```ruby
+require "async"
+Sync { client.start; ... }
+```
+
+Under Itsi, the server installs `Itsi::Scheduler` for you — just `client.start`.
+
+Apps that previously relied on `pg_pipeline` pulling in `async` transitively
+should add `gem "async"` themselves if they still use Async.
+
 ## [0.2.5] - 2026-08-03
 
 Control-plane cleanup on the multiplexed query path: fewer per-query allocations,

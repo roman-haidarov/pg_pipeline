@@ -1,10 +1,9 @@
 # frozen_string_literal: true
 
 require "pg"
-require "async"
-require "async/queue"
 
 require_relative "errors"
+require_relative "runtime"
 require_relative "bounded_queue"
 require_relative "server_caps"
 require_relative "request"
@@ -21,7 +20,7 @@ module PgPipeline
                   :owner_task, :reader_task, :writer_task
 
     attr_writer :readable_events, :results_read, :units_completed, :flush_calls,
-                :flush_incomplete, :dispatches
+                :flush_incomplete, :dispatches, :leaked_watchers
 
     def readable_events = @readable_events || 0
     def results_read = @results_read || 0
@@ -29,6 +28,7 @@ module PgPipeline
     def flush_calls = @flush_calls || 0
     def flush_incomplete = @flush_incomplete || 0
     def dispatches = @dispatches || 0
+    def leaked_watchers = @leaked_watchers || 0
 
     def initialize(conn, max_pending: DEFAULT_MAX_PENDING, max_in_flight: DEFAULT_MAX_IN_FLIGHT)
       @max_pending = DriverOps.positive_integer!(max_pending, :max_pending)
@@ -40,35 +40,19 @@ module PgPipeline
       DriverOps.warn_flush_coupling_once(@caps)
 
       @requests = BoundedQueue.new(@max_pending)
-      @events = Async::Queue.new
-      @reader_rearm = Async::Queue.new
-      @writer_commands = Async::Queue.new
+      @events = Runtime::Queue.new
+      @reader_rearm = Runtime::Queue.new
+      @writer_commands = Runtime::Queue.new
+
+      @accepting = @running = @draining = @needs_flush = @writer_armed = @request_event_pending = false
+      @readable_events = @results_read = @units_completed = @flush_calls =
+        @flush_incomplete = @dispatches = @leaked_watchers = @submitting = 0
+      @socket = @owner_task = @reader_task = @writer_task = @dispatching = nil
 
       @inflight = []
-      @dispatching = nil
-      @submitting = 0
-
-      @accepting = false
-      @running = false
-      @draining = false
-      @needs_flush = false
-      @writer_armed = false
-      @request_event_pending = false
-
-      @readable_events = 0
-      @results_read = 0
-      @units_completed = 0
-      @flush_calls = 0
-      @flush_incomplete = 0
-      @dispatches = 0
-
-      @socket = nil
-      @owner_task = nil
-      @reader_task = nil
-      @writer_task = nil
     end
 
-    def start(parent: Async::Task.current) = DriverOps.start(self, parent)
+    def start = DriverOps.start(self)
     def submit(request) = DriverOps.submit(self, request)
     def load = @requests.size + @inflight.size + @submitting + (@dispatching ? 1 : 0)
     def available? = @accepting && @running
@@ -91,7 +75,8 @@ module PgPipeline
         dispatches: dispatches,
         units_per_readable: DriverOps.ratio(units_completed, readable_events),
         results_per_readable: DriverOps.ratio(results_read, readable_events),
-        flush_calls_per_unit: DriverOps.ratio(flush_calls, units_completed)
+        flush_calls_per_unit: DriverOps.ratio(flush_calls, units_completed),
+        leaked_watchers: leaked_watchers
       }
     end
 
@@ -99,21 +84,19 @@ module PgPipeline
       return true unless available?
 
       probe = Request.build("SELECT 1", nil)
-      begin
-        submit(probe)
-        Async::Task.current.with_timeout(timeout) { probe.wait }
-        true
-      rescue Async::TimeoutError
-        DriverOps.abort_timed_out_health_probe(self, probe)
-      rescue QueryError, PipelineAbortedError
-        true
-      rescue ShutdownError, NotDispatchedError
-        true
-      rescue ConnectionLostError, PG::Error
-        false
-      ensure
-        probe.cancel! unless probe.settled?
-      end
+      submit(probe)
+      Runtime.with_timeout(timeout) { probe.wait }
+      true
+    rescue Runtime::TimeoutError
+      DriverOps.abort_timed_out_health_probe(self, probe)
+    rescue QueryError, PipelineAbortedError
+      true
+    rescue ShutdownError, NotDispatchedError
+      true
+    rescue ConnectionLostError, PG::Error
+      false
+    ensure
+      probe.cancel! if probe && !probe.settled?
     end
 
     def graceful_close = DriverOps.graceful_close(self)
@@ -124,6 +107,9 @@ module PgPipeline
   end
 
   module DriverOps
+    WATCHER_JOIN_TIMEOUT = 2.0
+    OWNER_JOIN_TIMEOUT = 5.0
+
     module_function
 
     def ratio(numerator, denominator)
@@ -155,8 +141,9 @@ module PgPipeline
       raise ArgumentError, "#{name} must be an integer >= 1"
     end
 
-    def start(d, parent)
+    def start(d)
       raise Error, "driver already started" if d.running
+      raise Error, "driver start requires an active Fiber scheduler" unless Fiber.scheduler
 
       d.conn.setnonblocking(true)
       d.conn.enter_pipeline_mode
@@ -165,15 +152,15 @@ module PgPipeline
       d.accepting = true
       d.running = true
 
-      d.reader_task = parent.async { reader_watcher(d) }
-      d.writer_task = parent.async { writer_watcher(d) }
-      d.owner_task = parent.async { owner_loop(d) }
+      d.reader_task = Runtime.spawn(name: :reader) { reader_watcher(d) }
+      d.writer_task = Runtime.spawn(name: :writer) { writer_watcher(d) }
+      d.owner_task = Runtime.spawn(name: :owner) { owner_loop(d) }
       d
     rescue Exception
       d.accepting = false
       d.running = false
-      stop_watchers(d)
-      safe_close_conn(d)
+      teardown_watchers(d)
+      join_owner(d)
       raise
     end
 
@@ -200,7 +187,7 @@ module PgPipeline
       d.accepting = false
       d.requests.close(ShutdownError.new("driver is closing"))
       d.events.enqueue(:close)
-      d.owner_task.wait
+      join_owner(d)
       nil
     end
 
@@ -210,7 +197,7 @@ module PgPipeline
       d.accepting = false
       d.requests.close(not_dispatched_error(error))
       d.events.enqueue([:abort, error])
-      d.owner_task.wait unless Async::Task.current.equal?(d.owner_task)
+      join_owner(d)
       nil
     end
 
@@ -232,7 +219,12 @@ module PgPipeline
     end
 
     def owner_loop(d)
-      process_event(d, d.events.dequeue) while d.running
+      while d.running
+        event = d.events.dequeue
+        break if event.nil?
+
+        process_event(d, event)
+      end
     rescue StandardError => e
       fatal_close(d, ConnectionLostError.new("driver crashed: #{e.class}: #{e.message}"))
     ensure
@@ -275,6 +267,7 @@ module PgPipeline
 
     def notify_requests(d)
       return if d.request_event_pending
+      return unless d.running
 
       d.request_event_pending = true
       d.events.enqueue(:requests)
@@ -377,6 +370,7 @@ module PgPipeline
 
     def arm_writer(d)
       return if d.writer_armed
+      return unless d.running
 
       d.writer_armed = true
       d.writer_commands.enqueue(:wait_writable)
@@ -466,14 +460,11 @@ module PgPipeline
       d.accepting = false
       d.running = false
 
-      begin
-        d.conn.exit_pipeline_mode
-      rescue PG::Error => e
-        fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
-      ensure
-        stop_watchers(d)
-        safe_close_conn(d)
-      end
+      d.conn.exit_pipeline_mode
+    rescue PG::Error => e
+      fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
+    ensure
+      teardown_watchers(d)
     end
 
     def fatal_close(d, error)
@@ -483,8 +474,8 @@ module PgPipeline
       d.running = false
       d.requests.close(not_dispatched_error(error))
       fail_all(d, error)
-      stop_watchers(d)
-      safe_close_conn(d)
+
+      teardown_watchers(d)
     end
 
     def fail_all(d, error)
@@ -549,19 +540,85 @@ module PgPipeline
       end
     end
 
-    def stop_watchers(d)
-      reader = d.reader_task
-      writer = d.writer_task
+    def teardown_watchers(d)
+      tasks = release_watchers(d)
+      close_wait_points(d)
+      begin
+        d.socket&.close
+      rescue StandardError
+        nil
+      end
+      stop_watchers(tasks)
+      join_watchers(d, tasks)
+      d.socket = nil
+      safe_close_conn(d)
+      nil
+    end
+
+    def release_watchers(d)
+      tasks = [d.reader_task, d.writer_task].compact
       d.reader_task = nil
       d.writer_task = nil
+      tasks
+    end
 
-      [reader, writer].each do |task|
-        task&.stop
-      rescue Async::Cancel, StandardError
+    def close_wait_points(d)
+      [d.reader_rearm, d.writer_commands, d.events].each do |queue|
+        queue&.close
+      rescue StandardError
+        nil
+      end
+    end
+
+    def stop_watchers(tasks)
+      Array(tasks).each do |task|
+        task.stop
+      rescue Runtime::Cancel, StandardError
         nil
       end
 
       nil
+    end
+
+    def join_watchers(d, tasks)
+      Array(tasks).each do |task|
+        task.wait(WATCHER_JOIN_TIMEOUT)
+      rescue Runtime::TimeoutError
+        d.leaked_watchers += 1
+        warn_leaked_task(d, task, WATCHER_JOIN_TIMEOUT)
+      rescue Runtime::Cancel, StandardError
+        nil
+      end
+
+      nil
+    end
+
+    def join_owner(d)
+      owner = d.owner_task
+      return if owner.nil?
+      return if Fiber.current.equal?(owner.fiber)
+
+      begin
+        owner.wait(OWNER_JOIN_TIMEOUT)
+      rescue Runtime::TimeoutError
+        d.leaked_watchers += 1
+        warn_leaked_task(d, owner, OWNER_JOIN_TIMEOUT)
+      rescue Runtime::Cancel, StandardError
+        nil
+      end
+
+      nil
+    end
+
+    def warn_leaked_task(d, task, timeout)
+      return if ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+
+      warn(
+        "pg_pipeline: task #{task.name.inspect} did not exit within " \
+        "#{timeout}s and has been leaked (total #{d.leaked_watchers}). " \
+        "Closing the duplexed socket_io / connection did not release the fiber " \
+        "(often parked in wait_readable/wait_writable)."
+      )
     end
 
     def safe_close_conn(d)
