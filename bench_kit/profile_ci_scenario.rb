@@ -105,36 +105,38 @@ puts "pipeline_size=#{pipeline} pinned_size=#{pinned} fibers=#{fibers} rounds=#{
 puts "measure=#{ENV.fetch('MEASURE', 'wall')} min_percent=#{min_percent} out=#{out_dir}"
 puts
 
-# Warmup outside profile
-Sync do |task|
-  client = PgPipeline::Client.new(
-    url, pipeline_size: pipeline, pinned_size: pinned, health_check: false
-  ).start(parent: task)
-  begin
-    5.times { |i| client.query("SELECT $1::int AS n", [i]) }
-    client.transaction { |tx| tx.query("SELECT 1") } if pinned.positive?
-    run_ci_scenario(client, task, [fibers, 32].min, pinned, verify: true)
-    puts "verify: OK (asserts run outside the profiler)"
-  ensure
-    client.close
+def with_client(url, pipeline, pinned)
+  result = nil
+  Sync do |task|
+    client = PgPipeline::Client.new(
+      url, pipeline_size: pipeline, pinned_size: pinned, health_check: false
+    ).start
+    begin
+      result = yield(client, task)
+    ensure
+      client.close
+    end
   end
+  result
+end
+
+with_client(url, pipeline, pinned) do |client, task|
+  5.times { |i| client.query("SELECT $1::int AS n", [i]) }
+  client.transaction { |tx| tx.query("SELECT 1") } if pinned.positive?
+  run_ci_scenario(client, task, [fibers, 32].min, pinned, verify: true)
+  puts "verify: OK (asserts run outside the profiler)"
+  $stdout.flush
 end
 
 GC.start
 profile = RubyProf::Profile.new(measure_mode: measure)
 result  = profile.profile do
-  Sync do |task|
-    client = PgPipeline::Client.new(
-      url, pipeline_size: pipeline, pinned_size: pinned, health_check: false
-    ).start(parent: task)
-    begin
-      rounds.times do |round|
-        stats = run_ci_scenario(client, task, fibers, pinned, verify: false)
-        puts "round=#{round + 1} live=#{stats.dig(:pipeline, :live)} reconnects=#{stats[:reconnects]}"
-      end
-    ensure
-      client.close
+  with_client(url, pipeline, pinned) do |client, task|
+    rounds.times do |round|
+      stats = run_ci_scenario(client, task, fibers, pinned, verify: false)
+      puts "round=#{round + 1} live=#{stats.dig(:pipeline, :live)} reconnects=#{stats[:reconnects]}"
     end
+    $stdout.flush
   end
 end
 

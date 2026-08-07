@@ -37,16 +37,18 @@ out_dir  = BenchKit.ensure_out_dir!
 stamp    = BenchKit.stamp
 
 def with_client(url, pipeline, pinned)
+  result = nil
   Sync do |task|
     client = PgPipeline::Client.new(
       url, pipeline_size: pipeline, pinned_size: pinned, health_check: false
-    ).start(parent: task)
+    ).start
     begin
-      yield client, task
+      result = yield(client, task)
     ensure
       client.close
     end
   end
+  result
 end
 
 # Pure gem calls only — no assertions, no comparison-array building.

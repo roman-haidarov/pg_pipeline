@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require "pg_pipeline"
 
 RSpec.describe "pg_pipeline live", :integration do
@@ -10,7 +11,7 @@ RSpec.describe "pg_pipeline live", :integration do
 
   def with_client(**opts, &block)
     Sync do |task|
-      client = PgPipeline::Client.new(@url, **opts).start(parent: task)
+      client = PgPipeline::Client.new(@url, **opts).start
       begin
         block.call(client, task)
       ensure
@@ -101,6 +102,19 @@ RSpec.describe "pg_pipeline live", :integration do
       expect(stats[:pipeline][:drivers].size).to eq(2)
       expect(stats).to include(:reconnects, :health_failures, :pinned, :closing)
       expect(stats[:pinned]).to include(:size, :active, :free, :in_use)
+    end
+  end
+
+  it "tears down pipeline watchers without leaks after close" do
+    Sync do |task|
+      client = PgPipeline::Client.new(@url, pipeline_size: 2, pinned_size: 0).start
+      client.query("SELECT 1")
+      client.close
+
+      pool = client.__send__(:pool)
+      drivers = pool.instance_variable_get(:@drivers)
+      leaked = drivers.sum { |d| d.leaked_watchers }
+      expect(leaked).to eq(0), "expected no leaked watchers after close, got #{leaked}"
     end
   end
 
@@ -270,7 +284,7 @@ RSpec.describe "pg_pipeline reliability", :integration do
     Sync do |task|
       client = PgPipeline::Client.new(
         url, pipeline_size: 1, pinned_size: 1, reconnect: true, reconnect_interval: 0.2
-      ).start(parent: task)
+      ).start
 
       begin
         expect(client.query("SELECT 1 AS n").first["n"].to_i).to eq(1)
@@ -302,7 +316,7 @@ RSpec.describe "pg_pipeline reliability", :integration do
 
   it "cancels in-flight pinned work on abort!" do
     Sync do |task|
-      client = PgPipeline::Client.new(@url, pipeline_size: 1, pinned_size: 1).start(parent: task)
+      client = PgPipeline::Client.new(@url, pipeline_size: 1, pinned_size: 1).start
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       worker = task.async do

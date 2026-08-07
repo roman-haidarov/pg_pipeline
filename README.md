@@ -24,12 +24,65 @@ At 10 ms RTT a naïve pool does ~100 queries/s per connection.
 A pipelined connection can do thousands — the wire stays full instead of sitting idle.
 
 `pg_pipeline` is the Ruby control plane that does exactly this: it multiplexes
-independent queries from many Async fibers onto a small pool of libpq connections,
+independent queries from many fibers onto a small pool of libpq connections,
 routes FIFO results back to the right fiber, and keeps transactional/session work
 on separate pinned connections. All wire protocol work stays in libpq; zero C code here.
 
 The single-owner connection model, FIFO result ownership, and lifecycle approach
 are directly inspired by tokio-postgres.
+
+## Any Fiber scheduler, not just Async
+
+Up to 0.2.x the control plane was built on the `async` gem: `Async::Task`,
+`Async::Queue`, `Async::Semaphore`, and a task tree rooted in Async's reactor.
+That made Falcon the only realistic host.
+
+0.3.0 removes that. The control plane is built on Ruby's `Fiber::Scheduler`
+interface — `Fiber.schedule` plus the scheduler's `block` / `unblock` — and on
+nothing else. The host installs whichever scheduler it likes; the gem never
+installs one and never calls a scheduler hook directly. `async` is now a
+development dependency only, and the sole runtime dependency is `pg`.
+
+```ruby
+# Falcon / any Async host — unchanged, still works
+Async do
+  client = PgPipeline::Client.open(ENV["DATABASE_URL"])
+  client.query("SELECT * FROM users WHERE id = $1", [id]).first
+end
+
+# Itsi, with its own scheduler — no Async anywhere
+# Itsi.rb:
+#   fiber_scheduler "Itsi::Scheduler"
+client = PgPipeline::Client.open(ENV["DATABASE_URL"])
+client.query("SELECT * FROM users WHERE id = $1", [id]).first
+```
+
+The call site does not change: `query` blocks the *fiber*, not the thread, so
+application code reads synchronously with no `await` and no coloured functions.
+The only hard requirement is that some scheduler is installed on the current
+thread — under a web server running requests in `Fiber.schedule` that is free,
+while a plain script or rake task must set one up itself.
+
+### What it buys
+
+On our benchmark stand (4 workers, `oha -z 60s -c 1000`, single-row lookup by
+primary key, local PostgreSQL 16):
+
+| gem | server | scheduler | req/s |
+|---|---|---|---:|
+| 0.2.5 | Falcon | Async | 23254 |
+| 0.3.0 | Falcon | Async | 23007 |
+| 0.3.0 | Itsi | Async | 29206 |
+| 0.3.0 | Itsi | Itsi::Scheduler | 29350 |
+
+Falcon throughput is unchanged — this was a portability change, not a
+Falcon optimisation. The gain comes from being *able* to move: an Itsi host is
+roughly **26% faster than the 0.2.5 Falcon baseline**, and that configuration
+simply could not run before, because 0.2.5 required an Async reactor.
+
+Numbers from one stand on one machine; treat them as a direction, not a
+guarantee. Your own ratio depends on payload size, RTT, and how much of the
+request is spent outside the database.
 
 ## Installation
 

@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "async"
-
 require_relative "errors"
 require_relative "pool"
 require_relative "request"
@@ -15,18 +13,18 @@ module PgPipeline
     attr_reader :guard
 
     def initialize(connection_args = nil, guard: :default, **pool_opts)
+      @owner_thread, @scheduler = nil, nil
+
       @guard = SessionGuard.normalize_mode!(guard)
       @pool = Pool.new(connection_args, **pool_opts)
       @started = false
-      @owner_thread = nil
-      @scheduler = nil
     end
 
     def self.open(connection_args = nil, **opts, &block)
       ClientOps.open(connection_args, opts, &block)
     end
 
-    def start(parent: Async::Task.current) = ClientOps.start(self, parent)
+    def start = ClientOps.start(self)
     def query(sql, params = RequestOps::EMPTY_PARAMS) = ClientOps.query(self, sql, params)
     def prepare(name, sql, param_types = nil) = ClientOps.prepare(self, name, sql, param_types)
     def stats = ClientOps.stats(self)
@@ -54,17 +52,16 @@ module PgPipeline
 
     def open(connection_args, opts)
       client = Client.new(connection_args, **opts).start
-      begin
-        yield client
-      ensure
-        client.close
-      end
+      yield client
+    ensure
+      client.close if client
     end
 
-    def start(client, parent)
+    def start(client)
       raise Error, "client already started" if started?(client)
+      raise Error, "client start requires an active Fiber scheduler" unless Fiber.scheduler
 
-      pool(client).start(parent: parent)
+      pool(client).start
       client.__send__(:owner_thread=, Thread.current)
       client.__send__(:scheduler=, Fiber.scheduler)
       client.__send__(:started=, true)
@@ -98,11 +95,9 @@ module PgPipeline
 
     def wait_for_request
       request = yield
-      begin
-        request.wait
-      ensure
-        request.cancel! unless request.settled?
-      end
+      request.wait
+    ensure
+      request.cancel! if request && !request.settled?
     end
 
     def submit_with_failover(client)
