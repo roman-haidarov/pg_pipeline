@@ -1,8 +1,7 @@
 # frozen_string_literal: true
 
-require "async/notification"
-
 require_relative "errors"
+require_relative "runtime"
 
 module PgPipeline
   class BoundedQueue
@@ -12,15 +11,14 @@ module PgPipeline
     rescue ArgumentError, TypeError
       raise ArgumentError, "limit must be an integer >= 1"
     else
-      @items = []
-      @consumers = []
-      @producers = []
+      @items, @consumers, @producers = [], [], []
+
       @closed = false
       @close_error = nil
     end
 
     def enqueue(item)
-      loop do
+      while true
         raise_close_error if @closed
 
         if @items.size < @limit
@@ -34,7 +32,7 @@ module PgPipeline
     end
 
     def dequeue
-      loop do
+      while true
         unless @items.empty?
           item = @items.shift
           wake_one(@producers)
@@ -72,13 +70,13 @@ module PgPipeline
     private
 
     def wait_on(list)
-      notification = Async::Notification.new
+      notification = Runtime::Notification.new
       list << notification
       completed = false
-      begin
-        notification.wait
-        completed = true
-      ensure
+      notification.wait
+      completed = true
+    ensure
+      if notification
         still_queued = list.delete(notification)
         wake_one(list) if !completed && still_queued.nil? && !@closed
       end

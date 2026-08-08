@@ -2,6 +2,7 @@
 
 require_relative "pg_pipeline/version"
 require_relative "pg_pipeline/errors"
+require_relative "pg_pipeline/runtime"
 require_relative "pg_pipeline/server_caps"
 require_relative "pg_pipeline/session_guard"
 require_relative "pg_pipeline/session"

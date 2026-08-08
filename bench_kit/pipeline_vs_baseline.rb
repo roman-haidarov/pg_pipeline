@@ -31,7 +31,7 @@ def bench_pipeline(task, url, concurrency, queries, pipeline, sql, prepared)
     pipeline_size: pipeline,
     pinned_size: 1,
     health_check: false
-  ).start(parent: task)
+  ).start
   statement = client.prepare("bench_ab", sql) if prepared
 
   total = concurrency * queries
@@ -61,8 +61,8 @@ def bench_pipeline(task, url, concurrency, queries, pipeline, sql, prepared)
   end.each(&:wait)
   wall = BenchKit.now - t0
   probe.stop
-  client.close
   BenchKit.report_latencies("pipeline", lat, wall, "server_conns" => peak, "pool" => pipeline)
+  client.close
 end
 
 def bench_baseline(task, url, concurrency, queries, baseline_pool, sql, prepared)
@@ -118,7 +118,7 @@ puts
 
 Sync do |task|
   # small warmup
-  warm = PgPipeline::Client.new(url, pipeline_size: 1, pinned_size: 0, health_check: false).start(parent: task)
+  warm = PgPipeline::Client.new(url, pipeline_size: 1, pinned_size: 0, health_check: false).start
   3.times { warm.query(sql) }
   warm.close
 

@@ -1,11 +1,9 @@
 # frozen_string_literal: true
 
 require "pg"
-require "async"
-require "async/semaphore"
-require "async/notification"
 
 require_relative "errors"
+require_relative "runtime"
 require_relative "connection_driver"
 require_relative "prepared_statement"
 require_relative "server_caps"
@@ -19,7 +17,9 @@ module PgPipeline
     DEFAULT_HEALTH_INTERVAL = 10.0
     DEFAULT_HEALTH_TIMEOUT = 5.0
     DISCARD_SEQUENCES_SERVER_VERSION = 90_400
-    CANCEL_SIGNAL = Async::Cancel
+    CANCEL_SIGNAL = Runtime::Cancel
+    SUPERVISOR_JOIN_TIMEOUT = 5.0
+    MAX_PAUSE_FAILURES = 3
 
     attr_reader :reconnects, :pipeline_size
 
@@ -58,7 +58,8 @@ module PgPipeline
       @health_failures = 0
       @supervisor_error = nil
       @supervisor = nil
-      @task_parent = nil
+      @supervisor_wake = Runtime::Notification.new
+      @pause_failures = 0
 
       @prepared_statements = {}
       @prepared_generation = 0
@@ -70,30 +71,28 @@ module PgPipeline
       @pinned_error = nil
       @pinned_active = 0
       @pinned_owners = Hash.new(0)
-      @pinned_idle = Async::Notification.new
+      @pinned_idle = Runtime::Notification.new
 
       @started = false
       @closing = false
       @closed = false
     end
 
-    def start(parent: nil)
+    def start
       raise Error, "pool already started" if @started
       if @closing || @closed
         raise ShutdownError, "pool is closing or was closed and cannot be restarted; create a new Pool"
       end
-
-      parent ||= Async::Task.current
-      @task_parent = parent
+      raise Error, "pool start requires an active Fiber scheduler" unless Fiber.scheduler
 
       begin
-        @pipeline_size.times { @drivers << start_pipeline_driver(parent) }
+        @pipeline_size.times { @drivers << start_pipeline_driver }
         @driver_backoff = Array.new(@drivers.size, 0.0)
         @driver_attempts = Array.new(@drivers.size, 0)
         @driver_last_health = Array.new(@drivers.size, monotonic)
-        @pinned_gate = Async::Semaphore.new(@pinned_size) if @pinned_size.positive?
+        @pinned_gate = Runtime::Semaphore.new(@pinned_size) if @pinned_size.positive?
         @started = true
-        @supervisor = parent.async { supervise } if @reconnect || @health_check
+        @supervisor = Runtime.spawn(name: :supervisor) { supervise } if @reconnect || @health_check
       rescue Exception
         cleanup_partial_start
         raise
@@ -174,9 +173,10 @@ module PgPipeline
       raise @pinned_error if @pinned_error
       raise Error, "pinned pool is disabled (pinned_size=0)" if @pinned_size.zero?
 
-      if @pinned_owners[Async::Task.current].positive?
+      owner = Fiber.current
+      if @pinned_owners[owner].positive?
         raise RecursiveCheckoutError,
-              "nested Client#session/transaction on the same task is not allowed; " \
+              "nested Client#session/transaction on the same fiber is not allowed; " \
               "use Transaction#savepoint for nested atomicity"
       end
 
@@ -184,7 +184,6 @@ module PgPipeline
         raise @pinned_error if @pinned_error
         raise ShutdownError, "pool is closing" if @closing
 
-        owner = Async::Task.current
         conn = nil
         @pinned_active += 1
         @pinned_owners[owner] += 1
@@ -220,6 +219,7 @@ module PgPipeline
         reconnects: @reconnects,
         health_failures: @health_failures,
         supervisor_error: @supervisor_error&.message,
+        supervisor_alive: supervisor_alive?,
         closing: @closing,
         closed: @closed,
         pinned_error: @pinned_error&.message
@@ -229,7 +229,7 @@ module PgPipeline
     def graceful_close
       return unless @started
 
-      if @pinned_owners[Async::Task.current].positive?
+      if @pinned_owners[Fiber.current].positive?
         raise Error, "cannot close the pool from inside Client#session/transaction"
       end
 
@@ -284,7 +284,7 @@ module PgPipeline
     def supervise
       until @closing
         begin
-          reap_and_replace(@task_parent) if @reconnect
+          reap_and_replace if @reconnect
           health_probe if @health_check
           @supervisor_error = nil
         rescue StandardError => e
@@ -292,9 +292,29 @@ module PgPipeline
         end
 
         break if @closing
-
-        sleep(supervisor_sleep_interval)
+        break unless supervisor_pause
       end
+    end
+
+    def supervisor_pause
+      @supervisor_wake.wait(supervisor_sleep_interval)
+      @pause_failures = 0
+      true
+    rescue StandardError => e
+      @supervisor_error = e
+      @pause_failures = (@pause_failures || 0) + 1
+
+      unless ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+        warn("pg_pipeline: supervisor pause failed (#{e.class}: #{e.message}) " \
+             "[#{@pause_failures}/#{MAX_PAUSE_FAILURES}]")
+      end
+
+      @pause_failures < MAX_PAUSE_FAILURES
+    end
+
+    def supervisor_alive?
+      supervisor = @supervisor
+      !supervisor.nil? && !supervisor.finished?
     end
 
     def supervisor_sleep_interval
@@ -305,7 +325,7 @@ module PgPipeline
       interval.positive? ? interval : @reconnect_interval
     end
 
-    def reap_and_replace(parent)
+    def reap_and_replace
       now = monotonic
       ensure_driver_slots!
 
@@ -316,7 +336,7 @@ module PgPipeline
         next if now < (@driver_backoff[index] || 0.0)
 
         begin
-          @drivers[index] = start_pipeline_driver(parent)
+          @drivers[index] = start_pipeline_driver
           @driver_backoff[index] = 0.0
           @driver_attempts[index] = 0
           @driver_last_health[index] = monotonic
@@ -339,10 +359,16 @@ module PgPipeline
         next if now - (@driver_last_health[index] || 0.0) < @health_interval
 
         @driver_last_health[index] = now
-        next if driver.health_check(@health_timeout)
 
-        @health_failures += 1
-        driver.abort!
+        begin
+          next if driver.health_check(@health_timeout)
+
+          @health_failures += 1
+          driver.abort!
+        rescue StandardError => e
+          @health_failures += 1
+          @supervisor_error = e
+        end
       end
     end
 
@@ -376,10 +402,21 @@ module PgPipeline
     def stop_supervisor
       supervisor = @supervisor
       @supervisor = nil
-      supervisor&.stop
+      return nil unless supervisor
+
+      @supervisor_wake.signal
+
+      begin
+        supervisor.wait(SUPERVISOR_JOIN_TIMEOUT)
+      rescue Runtime::TimeoutError
+        unless ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+          warn("pg_pipeline: supervisor did not exit within #{SUPERVISOR_JOIN_TIMEOUT}s and has been leaked")
+        end
+      rescue CANCEL_SIGNAL, StandardError
+        nil
+      end
+
       nil
-    rescue CANCEL_SIGNAL => e
-      e
     rescue StandardError
       nil
     end
@@ -413,11 +450,11 @@ module PgPipeline
       raise Error, "pool not started" unless @started
     end
 
-    def start_pipeline_driver(parent)
+    def start_pipeline_driver
       conn = PoolOps.new_connection(@connection_args)
       prepare_registered_statements(conn)
       driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight)
-      driver.start(parent: parent)
+      driver.start
     rescue Exception
       PoolOps.safe_close(conn) if conn
       raise
@@ -447,28 +484,26 @@ module PgPipeline
     end
 
     def release_pinned(owner, conn)
-      begin
-        if conn
-          if @closing
-            PoolOps.safe_close(conn)
-          else
-            recycled = recycle_pinned_connection(conn)
+      if conn
+        if @closing
+          PoolOps.safe_close(conn)
+        else
+          recycled = recycle_pinned_connection(conn)
 
-            if recycled
-              if @closing
-                PoolOps.safe_close(recycled)
-              else
-                @pinned_free << recycled
-              end
+          if recycled
+            if @closing
+              PoolOps.safe_close(recycled)
+            else
+              @pinned_free << recycled
             end
           end
         end
-      ensure
-        @pinned_active -= 1
-        @pinned_owners[owner] -= 1
-        @pinned_owners.delete(owner) if @pinned_owners[owner].zero?
-        @pinned_idle.signal if @pinned_active.zero?
       end
+    ensure
+      @pinned_active -= 1
+      @pinned_owners[owner] -= 1
+      @pinned_owners.delete(owner) if @pinned_owners[owner].zero?
+      @pinned_idle.signal if @pinned_active.zero?
     end
 
     def recycle_pinned_connection(conn)
@@ -513,7 +548,6 @@ module PgPipeline
       close_free_pinned
       @pinned_gate = nil
       @supervisor = nil
-      @task_parent = nil
       @started = false
       @closing = false
       @closed = false
