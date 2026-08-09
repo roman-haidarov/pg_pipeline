@@ -18,7 +18,6 @@ module PgPipeline
       "select-into-temp" => /\binto\s+(?:(?:global|local)\s+)?temp(?:orary)?\b/i,
       "select-into-pg-temp" => /\binto\s+(?:table\s+)?pg_temp(?:_\d+)?\s*\./i
     }.freeze
-
     STRICT_FORBIDDEN = {
       "nextval" => /\bnextval\s*\(/i,
       "setval" => /\bsetval\s*\(/i,
@@ -28,9 +27,9 @@ module PgPipeline
       "session-advisory-unlock" => /\bpg_advisory_unlock(?:_shared|_all)?\s*\(/i,
       "pg_export_snapshot" => /\bpg_export_snapshot\s*\(/i
     }.freeze
-
     PATTERN_PREFILTER = /\binto\b/i
-    NEEDS_MASK = /['"]|--|\/\*|\$[A-Za-z_0-9]*\$/
+    DOLLAR_QUOTE_TAG = /\A\$(?:(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_]|[^\x00-\x7F])*)?\$/
+    NEEDS_MASK = /['"]|--|\/\*|\$(?:(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_]|[^\x00-\x7F])*)?\$/
     LEADING_KEYWORD = /\A\s*([a-zA-Z_]+)/
     WHITESPACE_BYTES = [9, 10, 11, 12, 13, 32].freeze
 
@@ -84,7 +83,6 @@ module PgPipeline
       FORBIDDEN_PATTERNS.each do |name, pattern|
         return name if code.match?(pattern)
       end
-
       if mode == :strict
         STRICT_FORBIDDEN.each do |name, pattern|
           return "strict:#{name}" if code.match?(pattern)
@@ -111,7 +109,6 @@ module PgPipeline
       while index < size
         byte = source.getbyte(index)
         nxt = index + 1 < size ? source.getbyte(index + 1) : nil
-
         if block_depth.positive?
           if byte == 47 && nxt == 42
             block_depth += 1
@@ -159,7 +156,7 @@ module PgPipeline
 
         if byte == 36
           remainder = source.byteslice(index, size - index)
-          tag = remainder.match(/\A\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/)&.[](0)
+          tag = DOLLAR_QUOTE_TAG.match(remainder)&.[](0)
           if tag
             closing = source.index(tag, index + tag.bytesize)
             finish = closing ? closing + tag.bytesize : size
@@ -182,7 +179,6 @@ module PgPipeline
 
       while index < source.bytesize
         byte = source.getbyte(index)
-
         if escape_backslash && byte == 92
           output << " "
           index += 1
@@ -203,7 +199,6 @@ module PgPipeline
           index += 1
         end
       end
-
       index
     end
     private_class_method :mask_quoted

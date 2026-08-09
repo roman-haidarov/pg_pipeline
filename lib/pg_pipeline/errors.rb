@@ -8,6 +8,7 @@ module PgPipeline
   class ConnectionLostError < Error; end
   class NotDispatchedError < ConnectionLostError; end
   class IndeterminateResultError < ConnectionLostError; end
+  class IndeterminateCommitError < IndeterminateResultError; end
   class ShutdownError < Error; end
   class ProtocolError < Error; end
   class RecursiveCheckoutError < Error; end

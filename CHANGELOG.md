@@ -1,5 +1,62 @@
 # Changelog
 
+## [0.3.1] - 2026-08-09
+
+Reliability and correctness fixes on top of 0.3.0. No public API changes other
+than the new error class below; no changes to wire behaviour.
+
+### Fixed
+
+- `SessionGuard` dollar-quote masking now recognises tags containing non-ASCII
+  identifier bytes (e.g. `$тег$...$тег$`). Previously an unrecognised tag left
+  the quoted body unmasked, so its raw text was scanned by the forbidden-pattern
+  checks instead of being treated as an opaque literal.
+- `Client#transaction` now distinguishes a lost `COMMIT` acknowledgement from an
+  ordinary server-side rejection. If `COMMIT` fails while the connection is
+  still healthy (`status == CONNECTION_OK`, not `finished?`), the original
+  `PG::Error` is raised unchanged -- the server gave a complete answer and the
+  transaction did not commit. If the connection itself is gone or broken
+  (`PG::ConnectionBad`, `finished?`, or a non-OK status), the outcome is
+  genuinely unknown, and this is now raised as the new
+  `PgPipeline::IndeterminateCommitError < IndeterminateResultError` instead of
+  a bare `PG::Error`, so callers can tell "definitely rolled back" apart from
+  "may have committed, do not retry blindly" without inspecting connection
+  internals themselves. See the updated "Failure model" table in the README.
+
+### Reverted
+
+- The reader/writer watcher shutdown mechanism briefly introduced in this cycle
+  (self-pipe `Runtime::Wakeup` + `IO.select` on every socket wait) has been
+  removed before release. It fixed a real gap -- on schedulers with no way to
+  interrupt a fiber blocked in `wait_readable`/`wait_writable`, closing the
+  socket alone does not reliably wake it pre-Ruby-4.0 -- but at an unacceptable
+  cost: it moved the connection driver's hottest loop from `io_wait` (native,
+  zero extra threads) onto `IO.select`, and both reference schedulers implement
+  that hook expensively. `Async::Scheduler#io_select` spawns a new OS thread per
+  call; `Itsi::Scheduler#io_select` with more than one IO (our case: socket +
+  wakeup pipe) falls onto Itsi's bounded `blocking_operation_wait` worker pool
+  and holds a worker for the full duration of every idle wait, which can
+  exhaust that pool under a modest number of pipeline connections.
+- Root-caused instead: `Async::Scheduler` and `Itsi::Scheduler` both already
+  implement `#fiber_interrupt` as an ordinary library method, independent of
+  Ruby core's own hook of the same name (Ruby >= 4.0). `Task#stop` already
+  tries `#fiber_interrupt` first, so on both of this gem's reference schedulers
+  a blocked watcher is woken immediately via `fiber.raise`, on the same
+  `wait_readable`/`wait_writable` fast path as 0.3.0 -- no self-pipe needed.
+  `ConnectionDriver` now only falls back to a bounded
+  `wait_readable(timeout)`/`wait_writable(timeout)` poll
+  (`DriverOps::WATCHER_POLL_INTERVAL`, 0.25s) when the active scheduler does
+  *not* respond to `#fiber_interrupt`, guaranteeing shutdown within one poll
+  interval instead of depending on socket-close propagation. Async and Itsi
+  never pay this poll; an unknown/minimal scheduler does, bounded and cheap.
+- `teardown_watchers` also reverts to closing the socket/connection
+  unconditionally regardless of whether the watcher tasks joined in time. The
+  self-pipe version returned early when a watcher missed
+  `WATCHER_JOIN_TIMEOUT`, before closing the wakeup pipes, the socket, or the
+  `PG::Connection` -- turning a leaked *task* into a leaked live DB connection
+  and file descriptors. Resources are now always closed; only the task's own
+  fiber can still leak (tracked via `stats[:leaked_watchers]`, unchanged).
+
 ## [0.3.0] - 2026-08-07
 
 Scheduler-agnostic control plane: the gem no longer depends on the `async` gem
