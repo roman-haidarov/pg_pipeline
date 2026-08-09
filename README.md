@@ -265,7 +265,14 @@ If your workload mixes fast and slow queries, prefer one of:
 |---|---|---|
 | `NotDispatchedError` | query never reached the wire | ✅ yes |
 | `IndeterminateResultError` | query was sent, Sync not observed | ⚠️ only if idempotent |
+| `IndeterminateCommitError` | `Client#transaction`'s `COMMIT` acknowledgement was lost while the connection itself was gone/broken | ⚠️ never — the transaction may have committed |
 | `UnsafeMultiplexError` | session-mutating SQL on multiplexed path | — fix the call site |
+
+`IndeterminateCommitError < IndeterminateResultError`. It is raised only when the
+pinned connection looks dead (`PG::ConnectionBad`, `finished?`, or a non-OK
+status) at the moment `COMMIT` fails. If `COMMIT` fails while the connection is
+still healthy, that's the server giving a complete, unambiguous answer — the
+original `PG::Error` is raised as-is, and the transaction did not commit.
 
 Cancelling a fiber does **not** send `CancelRequest` to PostgreSQL — the query may
 still execute. For mutations, do not retry blindly after a timeout.

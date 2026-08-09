@@ -39,13 +39,35 @@ module PgPipeline
       tx.__send__(:open=, true)
       begin
         result = yield tx
-        conn.exec("COMMIT")
+        commit(conn)
         tx.__send__(:open=, false)
         result
       rescue Exception
         rollback_quietly(tx)
         raise
       end
+    end
+
+    def commit(conn)
+      conn.exec("COMMIT")
+    rescue PG::Error => error
+      raise unless indeterminate_commit_failure?(conn, error)
+
+      raise IndeterminateCommitError.new(
+        "COMMIT acknowledgement was not received; the transaction may have committed " \
+        "and must not be retried blindly (#{error.class}: #{error.message})"
+      ), cause: error
+    end
+
+    def indeterminate_commit_failure?(conn, error)
+      return true if defined?(PG::ConnectionBad) && error.is_a?(PG::ConnectionBad)
+      return true if conn.finished?
+
+      conn.status != PG::CONNECTION_OK
+    rescue PG::Error
+      true
+    rescue NoMethodError
+      false
     end
 
     def savepoint(tx, name)
@@ -57,7 +79,6 @@ module PgPipeline
       tx.__send__(:savepoint_seq=, seq)
       point = name || "pgp_sp_#{seq}"
       ident = conn.quote_ident(point)
-
       conn.exec("SAVEPOINT #{ident}")
       begin
         result = yield tx

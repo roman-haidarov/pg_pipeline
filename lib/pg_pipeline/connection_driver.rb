@@ -38,7 +38,6 @@ module PgPipeline
       @caps = ServerCaps.from_connection(conn)
       @caps.assert_supported!
       DriverOps.warn_flush_coupling_once(@caps)
-
       @requests = BoundedQueue.new(@max_pending)
       @events = Runtime::Queue.new
       @reader_rearm = Runtime::Queue.new
@@ -48,7 +47,6 @@ module PgPipeline
       @readable_events = @results_read = @units_completed = @flush_calls =
         @flush_incomplete = @dispatches = @leaked_watchers = @submitting = 0
       @socket = @owner_task = @reader_task = @writer_task = @dispatching = nil
-
       @inflight = []
     end
 
@@ -109,6 +107,7 @@ module PgPipeline
   module DriverOps
     WATCHER_JOIN_TIMEOUT = 2.0
     OWNER_JOIN_TIMEOUT = 5.0
+    WATCHER_POLL_INTERVAL = 0.25
 
     module_function
 
@@ -147,7 +146,6 @@ module PgPipeline
 
       d.conn.setnonblocking(true)
       d.conn.enter_pipeline_mode
-
       d.socket = d.conn.socket_io
       d.accepting = true
       d.running = true
@@ -233,7 +231,6 @@ module PgPipeline
 
     def process_event(d, event)
       input_changed = false
-
       case event
       when :requests
         d.request_event_pending = false
@@ -275,7 +272,6 @@ module PgPipeline
 
     def pump_requests(d)
       dispatched = false
-
       while d.inflight.size < d.max_in_flight && !d.requests.empty?
         request = d.requests.dequeue
         break unless request
@@ -356,7 +352,6 @@ module PgPipeline
       return unless d.running
 
       d.flush_calls += 1
-
       if d.conn.sync_flush
         d.needs_flush = false
       else
@@ -398,7 +393,6 @@ module PgPipeline
           end
 
           status = result.result_status
-
           case status
           when PG::PGRES_TUPLES_OK
             ensure_before_query_boundary!(request, status)
@@ -459,7 +453,6 @@ module PgPipeline
     def finish_graceful_close(d)
       d.accepting = false
       d.running = false
-
       d.conn.exit_pipeline_mode
     rescue PG::Error => e
       fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
@@ -511,10 +504,32 @@ module PgPipeline
       )
     end
 
+    def watcher_wait_timeout
+      scheduler = Fiber.scheduler
+      return nil if scheduler&.respond_to?(:fiber_interrupt)
+
+      WATCHER_POLL_INTERVAL
+    end
+
+    def wait_socket_readable(d, timeout)
+      loop do
+        return false unless d.running
+        return true if d.socket.wait_readable(timeout)
+      end
+    end
+
+    def wait_socket_writable(d, timeout)
+      loop do
+        return false unless d.running
+        return true if d.socket.wait_writable(timeout)
+      end
+    end
+
     def reader_watcher(d)
+      timeout = watcher_wait_timeout
+
       while d.running
-        d.socket.wait_readable
-        break unless d.running
+        break unless wait_socket_readable(d, timeout)
 
         d.events.enqueue(:readable)
         command = d.reader_rearm.dequeue
@@ -527,11 +542,13 @@ module PgPipeline
     end
 
     def writer_watcher(d)
+      timeout = watcher_wait_timeout
+
       while d.running
         command = d.writer_commands.dequeue
         break unless command == :wait_writable && d.running
+        break unless wait_socket_writable(d, timeout)
 
-        d.socket.wait_writable
         d.events.enqueue(:writable) if d.running
       end
     rescue StandardError => e
@@ -616,8 +633,8 @@ module PgPipeline
       warn(
         "pg_pipeline: task #{task.name.inspect} did not exit within " \
         "#{timeout}s and has been leaked (total #{d.leaked_watchers}). " \
-        "Closing the duplexed socket_io / connection did not release the fiber " \
-        "(often parked in wait_readable/wait_writable)."
+        "Closing the socket and, on schedulers without #fiber_interrupt, the " \
+        "#{WATCHER_POLL_INTERVAL}s watcher poll did not release the fiber in time."
       )
     end
 

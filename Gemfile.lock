@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    pg_pipeline (0.3.0)
+    pg_pipeline (0.3.1)
       pg (>= 1.5, < 2)
 
 GEM
