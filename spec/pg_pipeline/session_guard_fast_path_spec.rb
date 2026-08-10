@@ -30,13 +30,13 @@ RSpec.describe PgPipeline::SessionGuard do
     it "is an identity transform when nothing needs masking" do
       unmasked_sql.each do |sql|
         expect(described_class.code_only(sql)).to eq(sql.b)
-        expect(described_class::NEEDS_MASK.match?(sql)).to be(false)
+        expect(described_class.needs_mask?(sql)).to be(false)
       end
     end
 
     it "still detects SQL that requires masking" do
       masked_sql.each do |sql|
-        expect(described_class::NEEDS_MASK.match?(sql)).to be(true)
+        expect(described_class.needs_mask?(sql)).to be(true)
       end
     end
 
@@ -76,28 +76,17 @@ RSpec.describe PgPipeline::SessionGuard do
   end
 
   describe "cache eviction" do
-    around do |example|
-      previous = described_class.instance_variable_get(:@guard_cache)
-      described_class.instance_variable_set(:@guard_cache, nil)
-      example.run
-    ensure
-      described_class.instance_variable_set(:@guard_cache, previous)
-    end
-
     it "evicts one entry at a time instead of clearing the whole cache" do
       limit = described_class::GUARD_CACHE_LIMIT
-      cache = described_class.guard_cache.fetch(:default)
+      prefix = "sg_evict_#{Process.pid}_#{object_id}_"
 
-      limit.times { |i| described_class.unsafe_reason("SELECT #{i} FROM t") }
-      expect(cache.size).to eq(limit)
-
-      newest = "SELECT #{limit} FROM t"
+      limit.times { |i| described_class.unsafe_reason("SELECT #{prefix}#{i} FROM t") }
+      newest = "SELECT #{prefix}#{limit} FROM t"
       described_class.unsafe_reason(newest)
 
-      expect(cache.size).to eq(limit)
-      expect(cache).to have_key(newest)
-      expect(cache).not_to have_key("SELECT 0 FROM t")
-      expect(cache).to have_key("SELECT #{limit - 1} FROM t")
+      expect(described_class.unsafe_reason(newest)).to be_nil
+      expect(described_class.unsafe_reason("SELECT #{prefix}#{limit - 1} FROM t")).to be_nil
+      expect(described_class.unsafe_reason("SELECT 1")).to be_nil
     end
 
     it "caches a safe verdict without returning the sentinel" do

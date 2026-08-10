@@ -1,10 +1,11 @@
 # Performance tests
 
-Current release under test: **`pg_pipeline 0.2.4`**
+Current release under test: **`pg_pipeline 0.4.0`** — section 9 only.
 
-Historical comparison release: **`pg_pipeline 0.2.3`**
-
-Results collected: **2026-07-30 to 2026-07-31**
+Sections 1-8 are the HTTP A/B of **`0.2.4`** vs **`0.2.3`**, collected
+**2026-07-30 to 2026-07-31**. They predate the native data plane and are kept
+because the control-plane and connection-efficiency conclusions still hold; do
+not read them as 0.4.0 numbers.
 
 This document consolidates the performance work performed for `pg_pipeline 0.2.3`
 and the final release A/B for `0.2.4`. The latest HTTP matrices below use the final
@@ -288,6 +289,91 @@ This profiling supports the local control-plane optimization, but sampled percen
 are not throughput benchmarks and should not be compared as absolute performance
 between machines.
 
+## 9. Sealed dispatch payloads (0.4)
+
+An earlier iteration of the 0.4 data plane moved send/drain into C but still read
+`operation`, `sql`, `params`, `statement_name` and `param_types` back out of the
+Ruby `Request` on **every** dispatch, and re-encoded the parameters each time.
+The shipped version seals that work into a single arena when the request is
+built, so `dispatch` touches no Ruby object at all.
+
+Measured with `bench_kit/dispatch_cost.rb` (`rake bench:dispatch`): 50,000
+dispatches, so the number is request encoding + `PQsend*` + Sync and nothing
+else. Local PostgreSQL 16 over a Unix socket, shared CI-class machine --
+absolute values move between runs, the ratios did not. Collected on Ruby 3.2;
+the gem requires >= 3.3, so treat the absolute microseconds as indicative and
+the ratios as the result.
+
+> **Methodology note.** The table below was collected with the original version
+> of that bench, which sized the in-flight FIFO at `COUNT + 16` and never
+> flushed or drained. All 50,000 units therefore piled up in libpq's output
+> buffer, and the per-dispatch figure includes memcpy into a buffer growing into
+> the tens of megabytes, its reallocations, and a FIFO depth no real driver
+> reaches. The bench now flushes and drains every 64 units and times only the
+> dispatch window. Both columns moved by the same mechanism, so the **ratios**
+> below still stand; the **absolute microseconds do not** and will be lower on
+> the current bench. Re-collect before quoting them anywhere.
+
+| parameters | per-dispatch encode | sealed payload | change | objects/dispatch |
+| --- | --- | --- | --- | --- |
+| 0 | 14.79 us | 12.32 us | -16.8% | 1.00 -> 0.00 |
+| 1 | 15.74 us | 14.06 us | -10.7% | 1.00 -> 0.00 |
+| 2 | 16.74 us | 14.52 us | -13.2% | 1.00 -> 0.00 |
+| 8 | 37.51 us | 23.40 us | -37.6% | 1.00 -> 0.00 |
+
+A second run on a quieter machine showed -11.0%, -3.1% and -45.5% at 1, 2 and 8
+parameters. The pattern is what the change predicts: a fixed saving of five
+`rb_funcall`s and four `ALLOC_N`s per dispatch, plus a saving proportional to
+parameter count from not re-encoding.
+
+### What this does *not* show
+
+End-to-end throughput barely moves. Over a Unix socket with a two-parameter
+`SELECT`, 64 concurrent fibers and 20,000 queries:
+
+| | per-dispatch encode | sealed payload | sealed, no Ruby snapshots |
+| --- | --- | --- | --- |
+| queries/sec | 25,465 | 26,787 | 43,881 |
+| allocated objects/query | 13.37 | 13.33 | 11.34 |
+| retained malloc bytes/query | 166 | 348 | 348 |
+
+Read `allocated objects/query` as **per query, end to end** -- the `Request`, its
+sealed arena, the drained `Result`, the scheduler's bookkeeping and the fiber.
+It is not the cost of `#seal!`, which is about three objects, and it is not the
+cost of `#dispatch`, which is zero. Those three numbers get conflated easily;
+`rake bench:dispatch` now prints the dispatch-only and end-to-end figures in
+separate columns for exactly that reason.
+
+Sealing alone is worth roughly +3-5% across runs, which on a single-run
+comparison is close to noise. The 43,881 column is **not** an isolated
+measurement of snapshot removal: it changes two things at once, on a shared
+machine, minutes apart, with a within-build spread of 35k-45k qps. Only the
+allocation counts in that table are exact. The third column adds the removal of the pure-Ruby
+driver: with nothing left to read `request.params` at dispatch time, the frozen
+snapshot layer became dead weight and was deleted, taking two object
+allocations per query with it. Absolute throughput between columns is not
+directly comparable -- these runs are minutes apart on a shared machine, and the
+qps spread within a single build was as wide as 35k-45k -- but the allocation
+counts are exact and reproducible.
+PostgreSQL itself dominates a local trivial query, so the send path is a small
+share of the total. The honest summary:
+
+- the send path itself got 11-46% cheaper, and stopped allocating;
+- one arena per request replaces four transient allocations per dispatch, which
+  is why retained bytes per query go **up** while allocation *count* goes down;
+- expect the end-to-end effect to grow with parameter count, statement size and
+  RTT, and to stay small for trivial queries on a local socket;
+- if your workload is trivial queries over a Unix socket, the native data plane
+  is not the reason to upgrade. The reason is that there is now one
+  implementation of the protocol invariants instead of two.
+
+Reproduce both with:
+
+```bash
+PG_PIPELINE_URL=postgres://... bundle exec rake bench:dispatch
+PG_PIPELINE_URL=postgres://... bundle exec rake bench:throughput
+```
+
 ## What these results do and do not show
 
 They support the following practical claims:
@@ -323,6 +409,7 @@ bundle exec rake bench:throughput
 bundle exec rake bench:ab
 PREPARED=1 bundle exec rake bench:ab
 bundle exec rake bench:smoke
+bundle exec rake bench:dispatch
 bundle exec rake bench:metrics
 ```
 

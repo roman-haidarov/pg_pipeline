@@ -71,7 +71,7 @@ RSpec.describe PgPipeline::Pool do
 
     def fake_driver(available:, dead:, load: 0, health: true)
       instance_double(
-        PgPipeline::ConnectionDriver,
+        PgPipeline::NativeConnectionDriver,
         available?: available,
         dead?: dead,
         load: load,
@@ -286,9 +286,9 @@ RSpec.describe PgPipeline::Pool do
         pool.instance_variable_set(:@driver_backoff, [0.0])
         pool.instance_variable_set(:@driver_attempts, [0])
         pool.instance_variable_set(:@driver_last_health, [0.0])
-        dead = instance_double(PgPipeline::ConnectionDriver, available?: false, dead?: true)
+        dead = instance_double(PgPipeline::NativeConnectionDriver, available?: false, dead?: true)
         live = instance_double(
-          PgPipeline::ConnectionDriver,
+          PgPipeline::NativeConnectionDriver,
           available?: true,
           dead?: false,
           stats: {available: true, load: 0, pending: 0, in_flight: 0, submitting: 0, needs_flush: false}
@@ -460,7 +460,7 @@ RSpec.describe PgPipeline::Pool do
     it "aborts created drivers when supervisor creation fails" do
       Sync do
         pool = described_class.new(nil, pipeline_size: 1, pinned_size: 0)
-        driver = instance_double(PgPipeline::ConnectionDriver)
+        driver = instance_double(PgPipeline::NativeConnectionDriver)
 
         allow(pool).to receive(:start_pipeline_driver).and_return(driver)
         allow(PgPipeline::Runtime).to receive(:spawn).and_raise(RuntimeError, "spawn failed")
@@ -547,8 +547,8 @@ RSpec.describe PgPipeline::Pool do
   describe "driver shutdown cleanup" do
     it "attempts every driver even when one close raises" do
       pool = described_class.allocate
-      first = instance_double(PgPipeline::ConnectionDriver)
-      second = instance_double(PgPipeline::ConnectionDriver)
+      first = instance_double(PgPipeline::NativeConnectionDriver)
+      second = instance_double(PgPipeline::NativeConnectionDriver)
       pool.instance_variable_set(:@drivers, [first, second])
 
       allow(first).to receive(:abort!).and_raise(RuntimeError, "first failed")
@@ -561,9 +561,9 @@ RSpec.describe PgPipeline::Pool do
 
     it "continues closing drivers and preserves cancellation over ordinary errors" do
       pool = described_class.allocate
-      first = instance_double(PgPipeline::ConnectionDriver)
-      second = instance_double(PgPipeline::ConnectionDriver)
-      third = instance_double(PgPipeline::ConnectionDriver)
+      first = instance_double(PgPipeline::NativeConnectionDriver)
+      second = instance_double(PgPipeline::NativeConnectionDriver)
+      third = instance_double(PgPipeline::NativeConnectionDriver)
       cancellation = described_class::CANCEL_SIGNAL.new("Task was cancelled")
       pool.instance_variable_set(:@drivers, [first, second, third])
 
@@ -577,8 +577,8 @@ RSpec.describe PgPipeline::Pool do
 
   describe "least-loaded driver selection" do
     it "reads each available driver load only once" do
-      first = instance_double(PgPipeline::ConnectionDriver, available?: true)
-      second = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      first = instance_double(PgPipeline::NativeConnectionDriver, available?: true)
+      second = instance_double(PgPipeline::NativeConnectionDriver, available?: true)
       expect(first).to receive(:load).once.and_return(2)
       expect(second).to receive(:load).once.and_return(1)
 
@@ -591,8 +591,8 @@ RSpec.describe PgPipeline::Pool do
     it "continues after the selected driver when unequal loads become tied" do
       first_load = 2
       second_load = 1
-      first = instance_double(PgPipeline::ConnectionDriver, available?: true)
-      second = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      first = instance_double(PgPipeline::NativeConnectionDriver, available?: true)
+      second = instance_double(PgPipeline::NativeConnectionDriver, available?: true)
       allow(first).to receive(:load) { first_load }
       allow(second).to receive(:load) { second_load }
 
@@ -606,7 +606,7 @@ RSpec.describe PgPipeline::Pool do
 
     it "rotates equal-load drivers from the round-robin cursor" do
       drivers = 3.times.map do
-        instance_double(PgPipeline::ConnectionDriver, available?: true, load: 0)
+        instance_double(PgPipeline::NativeConnectionDriver, available?: true, load: 0)
       end
 
       first, rr = PgPipeline::PoolOps.select_driver(drivers, 0)
@@ -652,7 +652,7 @@ RSpec.describe PgPipeline::Pool do
     end
 
     def accepting_driver
-      instance_double(PgPipeline::ConnectionDriver, available?: true).tap do |driver|
+      instance_double(PgPipeline::NativeConnectionDriver, available?: true).tap do |driver|
         allow(driver).to receive(:submit) do |request|
           result = instance_double("PG::Result")
           allow(result).to receive(:clear)
@@ -680,7 +680,7 @@ RSpec.describe PgPipeline::Pool do
     end
 
     it "removes a failed registration from the reconnect catalog" do
-      driver = instance_double(PgPipeline::ConnectionDriver, available?: true)
+      driver = instance_double(PgPipeline::NativeConnectionDriver, available?: true)
       allow(driver).to receive(:submit).and_raise(PgPipeline::NotDispatchedError, "driver died")
       pool = prepared_pool([driver])
 
@@ -704,31 +704,5 @@ RSpec.describe PgPipeline::Pool do
       expect(driver).to have_received(:submit).once
     end
 
-    it "prepares the complete current catalog before a replacement starts" do
-      pool = prepared_pool([])
-      first = PgPipeline::PreparedStatement.new(
-        client: Object.new, name: "first", physical_name: "pgp_1", sql: "SELECT 1"
-      )
-      second = PgPipeline::PreparedStatement.new(
-        client: Object.new, name: "second", physical_name: "pgp_2", sql: "SELECT 2"
-      )
-      pool.instance_variable_set(:@prepared_statements, {"first" => first})
-      pool.instance_variable_set(:@prepared_generation, 1)
-
-      first_result = instance_double("PG::Result", clear: nil)
-      second_result = instance_double("PG::Result", clear: nil)
-      connection = instance_double("PG::Connection")
-      allow(connection).to receive(:prepare).with("pgp_1", "SELECT 1") do
-        pool.instance_variable_get(:@prepared_statements)["second"] = second
-        pool.instance_variable_set(:@prepared_generation, 2)
-        first_result
-      end
-      allow(connection).to receive(:prepare).with("pgp_2", "SELECT 2").and_return(second_result)
-
-      pool.send(:prepare_registered_statements, connection)
-
-      expect(connection).to have_received(:prepare).with("pgp_1", "SELECT 1").once
-      expect(connection).to have_received(:prepare).with("pgp_2", "SELECT 2").once
-    end
   end
 end

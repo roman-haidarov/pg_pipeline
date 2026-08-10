@@ -6,23 +6,43 @@ on:
     branches: [main]
 
 jobs:
-  unit:
+  hygiene:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with: { ruby-version: "3.3", bundler-cache: true }
-      - run: |
-          bundle exec ruby -rpg -e 'puts "linked libpq: #{PG.library_version}"'
-      - run: bundle exec rspec --exclude-pattern "spec/integration/**/*"
+      - name: Fail if a native build product is tracked
+        run: bundle exec rake verify_no_build_products
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.3", "3.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libpq headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq-dev
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Compile native extension
+        run: |
+          bundle exec rake compile
+          bundle exec ruby -e 'require "pg_pipeline"; puts "pg_pipeline=#{PgPipeline::VERSION} libpq_native=#{PgPipeline::Native.libpq_version} libpq_pg=#{PG.library_version} ruby=#{RUBY_VERSION}"'
+      - run: bundle exec rake spec
 
   integration:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # PostgreSQL *server* majors only.
-        pg: [14, 16, 17]
+        pg: [14, 16, 17, 18]
     services:
       postgres:
         image: postgres:${{ matrix.pg }}
@@ -33,11 +53,48 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      - name: Install libpq headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq-dev
       - uses: ruby/setup-ruby@v1
         with: { ruby-version: "3.3", bundler-cache: true }
-      - name: Report client libpq vs server
+      - name: Compile native extension
         run: |
-          bundle exec ruby -rpg -e 'puts "client libpq=#{PG.library_version} server_matrix=${{ matrix.pg }}"'
+          bundle exec rake compile
+          bundle exec ruby -e 'require "pg_pipeline"; puts "pg_pipeline=#{PgPipeline::VERSION} libpq_native=#{PgPipeline::Native.libpq_version} libpq_pg=#{PG.library_version} server_matrix=${{ matrix.pg }}"'
       - env:
           PG_PIPELINE_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: bundle exec rspec spec/integration
+        run: bundle exec rake integration
+
+  gem_install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libpq headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpq-dev build-essential
+      - uses: ruby/setup-ruby@v1
+        with: { ruby-version: "3.3", bundler-cache: true }
+      - name: Build and install the current tree as a gem
+        run: |
+          set -euo pipefail
+          expected_version="$(ruby -e 'require_relative "lib/pg_pipeline/version"; print PgPipeline::VERSION')"
+          gem build pg_pipeline.gemspec
+          gem_path="$(ls -1 pg_pipeline-*.gem | head -1)"
+          test -f "${gem_path}"
+          install_dir="${RUNNER_TEMP}/gem-install"
+          mkdir -p "${install_dir}"
+          gem install --no-document --install-dir "${install_dir}" --bindir "${install_dir}/bin" pg
+          gem install --no-document --install-dir "${install_dir}" --bindir "${install_dir}/bin" "${gem_path}"
+          cd "${RUNNER_TEMP}"
+          GEM_HOME="${install_dir}" GEM_PATH="${install_dir}" EXPECTED_VERSION="${expected_version}" \
+            ruby -e '
+              abort "checkout leaked onto load path" if $LOAD_PATH.any? { |p| p.include?("/pg_pipeline/lib") }
+              require "pg_pipeline"
+              expected = ENV.fetch("EXPECTED_VERSION")
+              puts "installed pg_pipeline=#{PgPipeline::VERSION} native=#{PgPipeline::Native.libpq_version} ruby_pg=#{PG.library_version}"
+              abort "version mismatch: installed=#{PgPipeline::VERSION} checkout=#{expected}" unless PgPipeline::VERSION == expected
+              abort "native core missing after gem install" unless defined?(PgPipeline::Native)
+            '

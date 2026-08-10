@@ -1,5 +1,277 @@
 # Changelog
 
+## [0.4.0] - 2026-08-11
+
+Native multiplexed data plane. Public SQL, Sync-per-unit, failure model, and
+`Fiber::Scheduler` control plane match 0.3.1; the implementation of the hot path
+moves into C. Read *Breaking changes* first: the return type of `Client#query`
+changed, and that is not something a 0.3 caller can discover from a green suite.
+
+### Breaking changes
+
+- **`Client#query` and `PreparedStatement#query` return a `PgPipeline::Result`,
+  not a `PG::Result`.** The native driver owns the `PGresult` and never builds a
+  ruby-pg object for it. The row and metadata surface is deliberately
+  spelled the same -- `#first`, `#each`, `#each_row`, `#to_a`, `#values`,
+  `#ntuples`/`#num_tuples`, `#nfields`/`#num_fields`, `#fields`, `#fname`,
+  `#fnumber`, `#ftype`, `#fmod`, `#getvalue`, `#getisnull`, `#getlength`,
+  `#tuple_values`, `#column_values`, `#field_values`, `#cmd_tuples`,
+  `#error_message`, `#error_field`, `#result_status`, `#clear` -- so ordinary row
+  handling needs no change. Two things cannot be carried over:
+  - `result.is_a?(PG::Result)` is now false. Introspection or dispatch written
+    against that check silently takes the other branch. Test for
+    `PgPipeline::Result`, or for the methods you actually call.
+  - ruby-pg's type-map machinery (`#map_types!`, `PG::BasicTypeMapForResults`)
+    is not available, and the multiplexed path always requests text-format
+    results. Values arrive as strings, which is what 0.3.1 also returned in
+    practice, but there is no longer a hook to change that.
+
+  Explicit transactions and `Client#session` are unaffected: they run on
+  ruby-pg and still hand back `PG::Result`.
+- **The `backend:` pool option is gone** along with the pure-Ruby multiplexed
+  driver. Passing it now raises an `ArgumentError` that says where it went and
+  what to pin instead, rather than Ruby's bare "unknown keyword: :backend".
+- **`Request#params` and `RequestOps.snapshot_params` / `snapshot_value` /
+  `immutable_values?` are gone.** Parameter bytes are copied into the sealed
+  arena at build time and are not retained as Ruby objects.
+- **Installing requires a C compiler and libpq >= 14 headers.** There is no
+  precompiled platform gem and no compiler-free fallback backend; pin
+  `~> 0.3.1` if you need one.
+
+### Added
+
+- C `SessionGuard` (masking, forbidden-call scan, two-generation verdict cache)
+  and C `BoundedQueue` (typed close, drain, fiber `block`/`unblock` waiters) on
+  the multiplexed submit path — justified hot-path work that previously
+  allocated Ruby strings/regex/Notification objects per query under load.
+- C extension (`ext/pg_pipeline_native`) owning multiplexed `PGconn` objects,
+  nonblocking connect/poll, pipeline dispatch/flush, full drain while
+  `!PQisBusy`, the fixed-capacity in-flight FIFO, and request completion.
+- `Native::RequestState` (TypedData) for request lifecycle and one-shot
+  fiber waiter `block`/`unblock` via the **stored** scheduler.
+- `Native::RequestState#seal!`: a request's dispatch payload is built once, when
+  the `Request` is constructed -- one arena allocation holding the side tables
+  plus NUL-terminated SQL, statement name and every parameter body. `dispatch`
+  reads only that arena and performs **zero** `rb_funcall`.
+- `Native::RequestState#adopt_payload!` and `Request#respawn`:
+  `NotDispatchedError` failover copies the sealed arena instead of re-encoding
+  SQL and parameters. The failed `Request` object is still never re-submitted.
+- `Native::Result` owning `PGresult*` with lazy row materialization and
+  idempotent `#clear`.
+- `Native::Driver#stats` exposing the hot-path counters, which live in the C
+  driver struct, plus `in_flight_peak` and `bytes_dispatched`, and
+  `Native::Driver#counter(name)` for reading a single counter without building
+  the Hash.
+- `Native::Driver#pipeline_aborted?`, so callers can tell an aborted pipeline
+  from an unusable connection instead of inferring it from `#reusable?`.
+- `SessionGuard.clear_cache!` / `.cache_size`, and the mode-normalizing
+  `unsafe_reason_c` / `assert_multiplexable_c!` entry points.
+- Load-time check that both native and ruby-pg libpq runtimes are >= 14.
+- `spec/support/reference_scheduler.rb`: a dependency-free `Fiber::Scheduler`
+  built on `IO.select`. The native specs run on it, so a failure points at
+  pg_pipeline rather than at Async or Itsi.
+- Live specs for the native data plane (`spec/integration/native_data_plane_spec.rb`),
+  sealed-payload unit specs, and specs for the reference scheduler itself.
+- Regression specs for seal-time reentrancy, delimited-identifier guard
+  evasion, and `BoundedQueue` close/wake behaviour.
+- CI (`.github/workflows/ci.yml`) tests **only the current tree** against the
+  runner's distro libpq: `rake compile` in every job that needs the extension,
+  a Ruby 3.3/3.4 unit matrix, a PostgreSQL **server** matrix 14/16/17/18, a gem
+  build/install job that loads the just-built gem from outside the checkout and
+  checks its version against `PgPipeline::VERSION`, and a hygiene job
+  (`rake verify_no_build_products`). No Valgrind job: memcheck does not model
+  CRuby fiber stacks and only produces false positives on this control plane.
+  libpq ≥ 14 remains a runtime requirement; the optional fast-Sync path
+  (libpq ≥ 17) is selected at compile/runtime from the linked client.
+- `bench_kit/dispatch_cost.rb` (`rake bench:dispatch`): isolated send-path cost
+  per parameter width.
+- `Native::Result#external_bytes` and `Native::Driver#encoding`, plus
+  `:encoding` per driver and `:seal_encoding` for the pipeline in
+  `Client#stats`, so an encoding mismatch is visible before it costs a request.
+- `SessionGuard` refuses `dblink_connect` / `dblink_disconnect`
+  (`dblink-session`), the large-object function family (`large-object`), and
+  Unicode-escaped delimited identifiers and the `UESCAPE` clause
+  (`unicode-escaped-identifier`, `uescape`).
+
+### Changed
+
+- Multiplexed send/drain no longer loops through ruby-pg per
+  `consume_input` / `is_busy` / `get_result` step.
+- `Request` is backed by `Native::RequestState`.
+- Query parameters are no longer snapshotted, frozen or retained on the Ruby
+  side. `#seal!` copies their bytes at build time, so the immutable-snapshot
+  layer that protected the Ruby data plane from later mutation is gone; the
+  equivalent guarantee is now provided inside `#seal!` itself (see *Fixed*).
+- Parameter encoding happens once per request instead of once per dispatch, and
+  parameter bodies are copied rather than borrowed from Ruby strings -- GC
+  compaction can relocate string bodies reachable from a marked array, so
+  borrowed pointers would have needed per-element pinning in the mark function.
+- `consume_and_drain` returns the completed-unit count as a Fixnum rather than a
+  freshly allocated Hash; `dispatches`, `flush_calls`, `flush_incomplete`,
+  `readable_events`, `results_read` and `units_completed` are incremented in C.
+  The owner loop does no bookkeeping.
+- Sealing validates SQL, statement names and parameters at `Request` build time,
+  so malformed input raises before the request is queued rather than in the
+  middle of the owner loop's dispatch. A failed seal cannot leave a partially
+  initialised payload: every Ruby call that can raise happens before the arena
+  is allocated.
+- The dispatch-byte counter is named `bytes_dispatched` rather than
+  `bytes_sealed`: it is incremented per dispatch, so a respawned request counts
+  twice, and the old name described something the number never measured.
+- The sealed-payload encoding is published by the **first** successful connect
+  and then left alone, instead of being overwritten by every connect. A payload
+  that carries non-ASCII text records the encoding it was sealed for, and
+  dispatch refuses to send it over a connection that negotiated a different
+  `client_encoding` (`UnsupportedServerError`, request-local and permanent)
+  rather than shipping mis-encoded bytes. All-ASCII payloads are unaffected.
+- Building the gem requires a C compiler and libpq development headers >= 14
+  (`PG_CONFIG` / Homebrew `libpq` discovery in `extconf.rb`). The extension is
+  built with `-std=gnu99`; set `PG_PIPELINE_STRICT_BUILD=1` to add `-Werror`.
+
+### Fixed
+
+- `Native::Result` tells the GC how much memory it is holding. A `PGresult`
+  lives entirely outside the Ruby heap and libpq exposes no size accessor, so
+  the collector saw a ~40 byte object and had no reason to run while hundreds of
+  megabytes of rows accumulated behind uncleared results. The size is estimated
+  once at wrap time (all columns, rows sampled and extrapolated past 64 to keep
+  the estimate O(1) on large results), reported through the TypedData `dsize`
+  hook and handed to `rb_gc_adjust_memory_usage`, and given back on `#clear`.
+  Calling `#clear` promptly is still the right thing to do -- this makes
+  forgetting it a latency problem rather than an unbounded-RSS one.
+- `SessionGuard` no longer accepts a Unicode-escaped delimited identifier.
+  `SELECT U&"pg_advisory_\006Cock"(1)` resolves to `pg_advisory_lock` on the
+  server, but masking hid the escaped form from the forbidden-call scan, so it
+  was classified session-neutral; the same held for every name the scanner
+  checks. Resolving the escapes here would mean reimplementing them including
+  the `UESCAPE` clause's configurable escape character, so the guard refuses
+  instead: a `U&"…"` identifier that is a plain run of identifier bytes has no
+  escapes to resolve and is still scanned as code, anything else is reported,
+  and a `UESCAPE` clause attached to a `U&` literal is reported on its own.
+- A connection whose negotiated `client_encoding` differs from the process-wide
+  seal encoding warns once at connect, instead of leaving the mismatch invisible
+  until the first query that happens to carry a non-ASCII byte.
+- `bench_kit/dispatch_cost.rb` flushes and drains every 64 units instead of
+  sizing the in-flight FIFO at `COUNT + 16` and never flushing. The old shape
+  accumulated 50,000 units in libpq's output buffer, so it timed memcpy into a
+  buffer growing into the tens of megabytes -- reallocations included -- at a
+  FIFO depth no driver reaches. It also now reports `#dispatch` allocations in
+  isolation separately from end-to-end allocations per unit, which are not the
+  same number and were easy to read as if they were.
+- `#seal!` no longer walks the caller's parameter array while running caller
+  Ruby on it. Converting a parameter calls `#to_s` (and, for the Hash form,
+  `#hash`/`#eql?`/`#to_int`); a conversion that shrank the array made the C walk
+  read past its end -- a segfault reachable from ordinary Ruby -- and a
+  conversion that replaced elements had its replacements sealed and sent.
+  Parameters are now snapshotted into a private array before any conversion
+  runs, and every converted body is frozen before the arena is sized, so the
+  length measured and the bytes copied cannot disagree.
+- `SessionGuard` no longer treats a delimited identifier as an opaque literal.
+  `SELECT "set_config"('a','b',false)` is an ordinary call and was classified
+  session-neutral; the same held for `"currval"`, `"lastval"`, `"setseed"` and
+  the advisory-lock family, schema-qualified or not. A quoted identifier whose
+  body is a single run of identifier bytes is now scanned as code. Anything
+  else -- `"a; b"`, `"into temp"`, `"weird(col"`, `"a""b"` -- stays fully
+  masked, so an identifier can never inject a statement separator or a call
+  site into the code being scanned.
+- The drain loop is no longer reentrant. `Scheduler#unblock`, `Result#clear` and
+  `QueryError`'s constructor are all caller Ruby that can re-enter the driver
+  while the loop holds a raw `PGconn*`; `#close` taken from that Ruby is now
+  deferred to the end of the drain instead of `PQfinish`-ing under the loop, the
+  connection is revalidated after every such call, and a nested drain raises
+  `ProtocolError` instead of corrupting the FIFO. The completed request is
+  popped before its waiter is woken, so a scheduler that resumes inline never
+  sees a settled request at the head of the queue.
+- `BoundedQueue#close` re-raises the exact exception object it was closed with.
+  It used to rebuild it from `(class, message)`, which dropped the backtrace and
+  `cause` and raised `ArgumentError` outright for any error class whose
+  `#initialize` is not a single String.
+- `BoundedQueue` wakes waiters from a detached copy of the waiter list. Waking
+  runs caller Ruby, so a waiter that queued during the walk used to be dropped
+  by the trailing length reset, and the walk itself could index a list that had
+  been reallocated.
+- `Request#respawn` assigns the same instance variables in the same order as the
+  constructor of its class, so a respawned request shares the object shape of a
+  freshly built one.
+- Text parameters, SQL and statement names are exported to the connection's
+  `client_encoding` when sealed, matching what ruby-pg does. A String in another
+  encoding used to be shipped as raw bytes, which PostgreSQL rejected
+  (`invalid byte sequence for encoding "UTF8"`). Binary-format parameters are
+  still copied byte for byte.
+- `#adopt_payload!` rebinds the copied arena from stored offsets instead of
+  subtracting pointers into two different allocations.
+- Result values from a binary-format column are tagged `ASCII-8BIT` rather than
+  the connection's `client_encoding`.
+- A native connection installs a notice processor, so `NOTICE`/`WARNING` no
+  longer go to the process's stderr.
+- Building the conninfo arrays from a Hash validates every string before
+  allocating, instead of leaking two `ALLOC_N` arrays when a value with an
+  embedded NUL raised between the allocation and the fill.
+- The `SessionGuard` verdict cache rotates two generations instead of calling
+  `Hash#keys` on every miss once full, which allocated a 2048-element Array
+  exactly when the cache had become useful.
+- `code_only` initialises its output buffer before masking, so a future missed
+  byte cannot leak uninitialised heap into a Ruby String.
+- `rake compile` regenerates the Makefile when the one on disk was produced for
+  a different platform, instead of failing to link a foreign object file, and
+  `rake integration` now depends on `:compile` like `rake spec` does.
+- Four `strict:` reason tags (`strict:set_config`, `strict:setseed`,
+  `strict:session-advisory-lock`, `strict:session-advisory-unlock`) were
+  unreachable by construction, because default mode returns first. Removed;
+  strict mode adds exactly `strict:nextval`, `strict:setval` and
+  `strict:pg_export_snapshot`, which is the behaviour the specs already pinned.
+- `SessionGuard.unsafe_reason_c` / `.assert_multiplexable_c!` were compiled and
+  then hidden behind a `(void)` cast. They are registered now.
+
+### Removed
+
+- `PgPipeline::ConnectionDriver`, the pure-Ruby multiplexed driver, and the
+  `backend:` pool option. libpq is now driven only from C on the multiplexed
+  path. Two implementations of the same protocol invariants were the largest
+  standing cost in this gem, and the option bought nothing: it was opt-in rather
+  than an automatic fallback, it could not help an install without a compiler
+  (the gemspec declares an extension), and callers who need a compiler-free
+  multiplexed driver already have one in the released 0.3.1. Behavioural
+  coverage for the current tree is the live integration suite plus the native
+  data-plane specs; CI does not reinstall older gem releases.
+- `RequestOps.snapshot_params` / `snapshot_value` / `immutable_values?` and
+  `Request#params`, all of which existed only to hand safe objects to the Ruby
+  driver at dispatch time.
+- The committed macOS arm64 build products under `ext/pg_pipeline_native/`.
+  They were tracked despite `.gitignore`, and because `native.rb` preferred a
+  build sitting next to the sources, a clone on Apple Silicon loaded that binary
+  instead of the one it had just compiled. `native.rb` now prefers the extension
+  on the load path and only falls back to `ext/`.
+
+### Unchanged
+
+- Control plane stays on `PgPipeline::Runtime` (any `Fiber::Scheduler`).
+- ruby-pg remains a runtime dependency: pinned sessions and explicit
+  transactions still run on `PG::Connection`.
+- Owner/reader/writer task model, BoundedQueue, pool supervisor, SessionGuard,
+  pinned sessions/transactions on ruby-pg.
+- Drain only after socket-readable + `consume_input` (no archive-style
+  completion budget / continue_drain by default).
+
+### Known limitations
+
+- All multiplexed connections in one process must share a `client_encoding`.
+  Payloads are sealed before a driver is chosen, so the seal target is
+  process-wide; a mismatch is detected and reported rather than silently
+  mis-encoded, but it is not resolved.
+- The multiplexed path always requests text-format results. Binary result
+  format is not reachable from the native driver.
+- COPY is not supported on the multiplexed pipeline.
+- `SessionGuard` scans masked SQL; it does not resolve the catalog. Session
+  side effects inside a called function (`SELECT my_udf(1)` where `my_udf` does
+  a `SET`) and sequence advances reached indirectly (an `INSERT` into a `serial`
+  column setting `currval`) are not detectable and are not detected. The second
+  is contained by `currval`/`lastval` being refused on the multiplexed path.
+  See the README section on what the guard does and does not catch.
+- End-to-end throughput gain from the native data plane is small on a local
+  socket with trivial queries (see `docs/PERFORMANCE.md` §9); the send path
+  itself is 11-46% cheaper and no longer allocates.
+
 ## [0.3.1] - 2026-08-09
 
 Reliability and correctness fixes on top of 0.3.0. No public API changes other

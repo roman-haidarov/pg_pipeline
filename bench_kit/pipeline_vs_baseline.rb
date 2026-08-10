@@ -1,15 +1,5 @@
 # frozen_string_literal: true
 
-# A/B: pg_pipeline (few connections + pipeline) vs naive connection-pool baseline
-# under the same concurrency. Point at a latency_proxy endpoint to see RTT wins.
-#
-#   # terminal 1
-#   bundle exec rake bench:proxy RTT_MS=10 UPSTREAM=127.0.0.1:5417
-#   # terminal 2
-#   PG_PIPELINE_URL=postgres://postgres:postgres@127.0.0.1:6432/postgres \
-#     CONCURRENCY=500 PIPELINE_SIZE=4 BASELINE_POOL=32 \
-#     bundle exec rake bench:ab
-
 require "async"
 require "async/queue"
 require "pg"
@@ -117,9 +107,8 @@ puts "(use rake bench:proxy + proxy URL to see RTT amortization)"
 puts
 
 Sync do |task|
-  # small warmup
   warm = PgPipeline::Client.new(url, pipeline_size: 1, pinned_size: 0, health_check: false).start
-  3.times { warm.query(sql) }
+  3.times { warm.query(sql).clear }
   warm.close
 
   bench_pipeline(task, url, concurrency, queries, pipeline, sql, prepared)

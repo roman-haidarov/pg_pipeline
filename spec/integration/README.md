@@ -12,10 +12,13 @@ PG_PIPELINE_URL=postgres://postgres:postgres@localhost:5418/postgres \
 ```
 
 Set `PG_PIPELINE_URL` to point at each server in the matrix (14 / 16 / 17 / 18)
-to exercise supported server generations. The Sync implementation path is chosen
-from the linked **client libpq**, not the server; `.github/workflows/ci.yml` has a
-separate source-built client-libpq 14/16/17 matrix that also runs this live suite
-for capability coverage.
+to exercise supported server generations. CI uses the runner's distro **client**
+libpq for all jobs; the Sync path (fast `PQsendPipelineSync` vs flush-coupled
+`PQpipelineSync`) follows whatever that client is, not the server major.
+
+Specs that reach into `PgPipeline::Native` are tagged `:native_only` and live in
+`native_data_plane_spec.rb` (and native-only unit files). Keep shared behavioural
+coverage in `integration_spec.rb` so both paths stay readable.
 
 ## Covered by `integration_spec.rb`
 
@@ -33,7 +36,24 @@ for capability coverage.
 - savepoints on pinned transactions
 - `stats` shape (`reconnects`, `health_failures`, pinned in_use); SessionGuard rejects `SET`
 
+## Covered by `native_data_plane_spec.rb` (`:native_only`)
+
+- bound / non-ASCII / binary parameters round-trip through the sealed arena
+- server-side error stays request-local
+- dispatch reads no Ruby accessor on the request
+- many completed units per socket wakeup (`units_per_readable > 1`)
+- hot-path counters come straight from the C driver
+- `PGresult` size is reported to the GC and given back on `#clear`
+- ruby-pg row spellings (`each_row`, `num_tuples`, `num_fields`) on the native result
+- per-driver `:encoding` against the process-wide `:seal_encoding`
+
 ## Still manual / future
 
 - `bench_kit/multiworker_smoke.rb` — multi-process connection occupancy
 - dedicated live health-probe failure (half-open idle) without manual fault injection
+- fault injection beyond `pg_terminate_backend`: half-open TCP, packet loss and a
+  server restart mid-burst are not exercised. `bench_kit/latency_proxy.rb` is the
+  obvious place to grow this from, since it already sits in the connection path.
+- multi-encoding: the mismatch warning and the dispatch-time
+  `UnsupportedServerError` are unit-covered, but no live job runs two servers
+  with different `client_encoding` in one process.

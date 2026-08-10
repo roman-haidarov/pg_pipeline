@@ -22,23 +22,20 @@ RSpec.describe PgPipeline::Request do
     Async(&block).wait
   end
 
-  it "snapshots query parameters before asynchronous dispatch" do
-    async_example do
-      string = +"one"
-      value = +"two"
-      params = [string, {value: value, type: 0}]
-      request = described_class.new(sql: "SELECT $1, $2", params: params)
+  it "captures query parameters at build time, before asynchronous dispatch" do
+    string = +"one"
+    value = +"two"
+    params = [string, {value: value, type: 0}]
+    request = described_class.new(sql: "SELECT $1, $2", params: params)
 
-      string.replace("changed")
-      value.replace("changed")
-      params << "three"
+    string.replace("changed")
+    value.replace("changed")
+    params << "three"
 
-      expect(request.params).to eq(["one", {value: "two", type: 0}])
-      expect(request.params).to be_frozen
-      expect(request.params[0]).to be_frozen
-      expect(request.params[1]).to be_frozen
-      expect(request.params[1][:value]).to be_frozen
-    end
+    # The bytes libpq will be handed were copied into the sealed arena; nothing
+    # the caller does to the original objects can reach the wire.
+    expect(request.payload_digest[:values]).to eq(["one", "two"])
+    expect(request.payload_digest[:count]).to eq(2)
   end
 
   it "does not settle a successful result until the Sync boundary" do
@@ -174,7 +171,7 @@ RSpec.describe PgPipeline::Request do
     expect(request.operation).to eq(:prepared_query)
     expect(request.statement_name).to eq("pgp_1")
     expect(request.sql).to equal(statement.sql)
-    expect(request.params).to eq([1])
+    expect(request.payload_digest[:values]).to eq(["1"])
   end
 
   it "builds prepare requests with a stable parameter type snapshot" do
@@ -193,35 +190,31 @@ RSpec.describe PgPipeline::Request do
     expect(request.param_types).to be_frozen
   end
 
-  describe ".build / snapshot_params" do
+  describe ".build" do
     it "builds a query request without keyword-argument allocation on the hot path" do
       sql = "SELECT $1::int AS n".freeze
       params = [1].freeze
       request = described_class.build(sql, params)
 
       expect(request.sql).to equal(sql)
-      expect(request.params).to equal(params)
+      expect(request.payload_digest[:values]).to eq(["1"])
       expect(request.state).to eq(:new)
       expect(request.settled?).to be(false)
       expect(request.cancelled?).to be(false)
       expect(request.operation).to eq(:query)
     end
 
-    it "maps nil and empty params to the shared EMPTY_PARAMS constant" do
-      empty = PgPipeline::RequestOps::EMPTY_PARAMS
-
-      expect(PgPipeline::RequestOps.snapshot_params(nil)).to equal(empty)
-      expect(PgPipeline::RequestOps.snapshot_params([])).to equal(empty)
-      expect(described_class.build("SELECT 1".freeze, nil).params).to equal(empty)
+    it "treats nil and empty params alike" do
+      expect(described_class.build("SELECT 1".freeze, nil).payload_digest[:count]).to eq(0)
+      expect(described_class.build("SELECT 1".freeze, []).payload_digest[:count]).to eq(0)
     end
 
-    it "reuses a frozen array of immutable values without copying" do
-      params = [1, "x".freeze, nil, true, :sym].freeze
-
-      expect(PgPipeline::RequestOps.snapshot_params(params)).to equal(params)
+    it "rejects params that are not an Array" do
+      expect { described_class.build("SELECT $1", "nope") }
+        .to raise_error(ArgumentError, /params must be an Array/)
     end
 
-    it "still snapshots mutable string params so callers cannot race the wire" do
+    it "does not retain the caller's parameter objects after sealing" do
       string = +"one"
       params = [string]
       request = described_class.build("SELECT $1".freeze, params)
@@ -229,9 +222,8 @@ RSpec.describe PgPipeline::Request do
       string.replace("changed")
       params << "two"
 
-      expect(request.params).to eq(["one"])
-      expect(request.params).to be_frozen
-      expect(request.params[0]).to be_frozen
+      expect(request.payload_digest[:values]).to eq(["one"])
+      expect(request.payload_digest[:count]).to eq(1)
     end
   end
 end

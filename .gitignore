@@ -5,3 +5,14 @@
 .ruby-version
 .ruby-gemset
 .DS_Store
+# gitignore does not expand {a,b} braces — list each suffix explicitly.
+/ext/**/Makefile
+/ext/**/mkmf.log
+/ext/**/*.o
+/ext/**/*.so
+/ext/**/*.bundle
+/ext/**/*.dylib
+/ext/**/*.bundle.dSYM/
+/ext/**/*.dSYM/
+
+samples/results

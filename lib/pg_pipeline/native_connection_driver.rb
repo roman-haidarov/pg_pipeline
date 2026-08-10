@@ -1,79 +1,110 @@
 # frozen_string_literal: true
 
-require "pg"
-
 require_relative "errors"
 require_relative "runtime"
 require_relative "bounded_queue"
+require_relative "native"
 require_relative "server_caps"
 require_relative "request"
 
 module PgPipeline
-  class ConnectionDriver
+  class NativeConnectionDriver
     DEFAULT_MAX_PENDING = 256
     DEFAULT_MAX_IN_FLIGHT = 64
+    FLUSH_THRESHOLD = 16
 
-    attr_reader :conn, :caps, :max_pending, :max_in_flight
+    attr_reader :max_pending, :max_in_flight, :core, :caps
     attr_accessor :socket, :requests, :events, :reader_rearm, :writer_commands,
-                  :inflight, :dispatching, :submitting, :accepting, :running,
-                  :draining, :needs_flush, :writer_armed, :request_event_pending,
+                  :dispatching, :submitting, :pending, :accepting, :running, :draining,
+                  :reader_draining, :needs_flush, :flush_pending, :flush_event_pending,
+                  :unflushed, :writer_armed, :request_event_pending,
                   :owner_task, :reader_task, :writer_task
 
-    attr_writer :readable_events, :results_read, :units_completed, :flush_calls,
-                :flush_incomplete, :dispatches, :leaked_watchers
+    attr_writer :leaked_watchers
 
-    def readable_events = @readable_events || 0
-    def results_read = @results_read || 0
-    def units_completed = @units_completed || 0
-    def flush_calls = @flush_calls || 0
-    def flush_incomplete = @flush_incomplete || 0
-    def dispatches = @dispatches || 0
+    def core_counters = @core.stats
+    def readable_events = @core.counter(:readable_events)
+    def results_read = @core.counter(:results_read)
+    def units_completed = @core.counter(:units_completed)
+    def flush_calls = @core.counter(:flush_calls)
+    def flush_incomplete = @core.counter(:flush_incomplete)
+    def dispatches = @core.counter(:dispatches)
+    def bytes_dispatched = @core.counter(:bytes_dispatched)
     def leaked_watchers = @leaked_watchers || 0
 
-    def initialize(conn, max_pending: DEFAULT_MAX_PENDING, max_in_flight: DEFAULT_MAX_IN_FLIGHT)
-      @max_pending = DriverOps.positive_integer!(max_pending, :max_pending)
-      @max_in_flight = DriverOps.positive_integer!(max_in_flight, :max_in_flight)
+    def encoding_name
+      @core.closed? ? nil : @core.encoding.name
+    rescue Error
+      nil
+    end
 
-      @conn = conn
-      @caps = ServerCaps.from_connection(conn)
-      @caps.assert_supported!
-      DriverOps.warn_flush_coupling_once(@caps)
+    def initialize(connection_args,
+                   max_pending: DEFAULT_MAX_PENDING,
+                   max_in_flight: DEFAULT_MAX_IN_FLIGHT)
+      @max_pending = NativeDriverOps.positive_integer!(max_pending, :max_pending)
+      @max_in_flight = NativeDriverOps.positive_integer!(max_in_flight, :max_in_flight)
+
+      @core = Native::Driver.new(connection_args, @max_in_flight)
+      @caps = nil
       @requests = BoundedQueue.new(@max_pending)
       @events = Runtime::Queue.new
       @reader_rearm = Runtime::Queue.new
       @writer_commands = Runtime::Queue.new
 
-      @accepting = @running = @draining = @needs_flush = @writer_armed = @request_event_pending = false
-      @readable_events = @results_read = @units_completed = @flush_calls =
-        @flush_incomplete = @dispatches = @leaked_watchers = @submitting = 0
-      @socket = @owner_task = @reader_task = @writer_task = @dispatching = nil
-      @inflight = []
+      @dispatching = nil
+      @submitting = 0
+      @pending = 0
+      @accepting = false
+      @running = false
+      @draining = false
+      @reader_draining = false
+      @needs_flush = false
+      @flush_pending = false
+      @flush_event_pending = false
+      @unflushed = 0
+      @writer_armed = false
+      @request_event_pending = false
+      @socket = nil
+      @owner_task = nil
+      @reader_task = nil
+      @writer_task = nil
+      @leaked_watchers = 0
     end
 
-    def start = DriverOps.start(self)
-    def submit(request) = DriverOps.submit(self, request)
-    def load = @requests.size + @inflight.size + @submitting + (@dispatching ? 1 : 0)
+    def start = NativeDriverOps.start(self)
+    def submit(request) = NativeDriverOps.submit(self, request)
     def available? = @accepting && @running
     def dead? = !@running && !@accepting
+    def load
+      extra = @pending + @submitting + (@dispatching ? 1 : 0)
+      @core.inflight_plus(extra)
+    end
 
     def stats
+      counters = core_counters
+      readable = counters.fetch(:readable_events)
+      units = counters.fetch(:units_completed)
+
       {
         available: available?,
         load: load,
         pending: @requests.size,
-        in_flight: @inflight.size,
+        in_flight: counters.fetch(:in_flight),
+        in_flight_peak: counters.fetch(:in_flight_peak),
         submitting: @submitting,
         needs_flush: @needs_flush,
-        fast_sync: @caps.fast_sync?,
-        readable_events: readable_events,
-        results_read: results_read,
-        units_completed: units_completed,
-        flush_calls: flush_calls,
-        flush_incomplete: flush_incomplete,
-        dispatches: dispatches,
-        units_per_readable: DriverOps.ratio(units_completed, readable_events),
-        results_per_readable: DriverOps.ratio(results_read, readable_events),
-        flush_calls_per_unit: DriverOps.ratio(flush_calls, units_completed),
+        fast_sync: @caps&.fast_sync? || false,
+        encoding: encoding_name,
+        readable_events: readable,
+        results_read: counters.fetch(:results_read),
+        units_completed: units,
+        flush_calls: counters.fetch(:flush_calls),
+        flush_incomplete: counters.fetch(:flush_incomplete),
+        dispatches: counters.fetch(:dispatches),
+        bytes_dispatched: counters.fetch(:bytes_dispatched),
+        units_per_readable: NativeDriverOps.ratio(units, readable),
+        results_per_readable: NativeDriverOps.ratio(counters.fetch(:results_read), readable),
+        flush_calls_per_unit: NativeDriverOps.ratio(counters.fetch(:flush_calls), units),
         leaked_watchers: leaked_watchers
       }
     end
@@ -86,25 +117,25 @@ module PgPipeline
       Runtime.with_timeout(timeout) { probe.wait }
       true
     rescue Runtime::TimeoutError
-      DriverOps.abort_timed_out_health_probe(self, probe)
+      NativeDriverOps.abort_timed_out_health_probe(self, probe)
     rescue QueryError, PipelineAbortedError
       true
     rescue ShutdownError, NotDispatchedError
       true
-    rescue ConnectionLostError, PG::Error
+    rescue ConnectionLostError
       false
     ensure
       probe.cancel! if probe && !probe.settled?
     end
 
-    def graceful_close = DriverOps.graceful_close(self)
+    def graceful_close = NativeDriverOps.graceful_close(self)
 
     def abort!(error = ConnectionLostError.new("connection aborted"))
-      DriverOps.abort!(self, error)
+      NativeDriverOps.abort!(self, error)
     end
   end
 
-  module DriverOps
+  module NativeDriverOps
     WATCHER_JOIN_TIMEOUT = 2.0
     OWNER_JOIN_TIMEOUT = 5.0
     WATCHER_POLL_INTERVAL = 0.25
@@ -115,6 +146,34 @@ module PgPipeline
       return 0.0 if denominator.zero?
 
       (numerator.to_f / denominator).round(3)
+    end
+
+    def positive_integer!(value, name)
+      integer = Integer(value)
+      raise ArgumentError, "#{name} must be >= 1" if integer < 1
+
+      integer
+    rescue ArgumentError, TypeError
+      raise ArgumentError, "#{name} must be an integer >= 1"
+    end
+
+    def warn_encoding_mismatch_once(d)
+      return unless Native.seal_encoding_published?
+
+      sealed = Native.seal_encoding
+      negotiated = d.core.encoding
+      return if negotiated == sealed
+      return if @encoding_mismatch_warned
+      return if ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+
+      @encoding_mismatch_warned = true
+      warn(
+        "pg_pipeline: this connection negotiated client_encoding #{negotiated} but request " \
+        "payloads in this process are sealed for #{sealed} (fixed by the first connection). " \
+        "All-ASCII queries are unaffected; any query carrying a non-ASCII byte will fail with " \
+        "UnsupportedServerError. Use one client_encoding per process, or a separate process " \
+        "per encoding. Set PG_PIPELINE_SILENCE_WARNINGS=1 to silence this."
+      )
     end
 
     def warn_flush_coupling_once(caps)
@@ -131,22 +190,12 @@ module PgPipeline
       )
     end
 
-    def positive_integer!(value, name)
-      integer = Integer(value)
-      raise ArgumentError, "#{name} must be >= 1" if integer < 1
-
-      integer
-    rescue ArgumentError, TypeError
-      raise ArgumentError, "#{name} must be an integer >= 1"
-    end
-
     def start(d)
       raise Error, "driver already started" if d.running
       raise Error, "driver start requires an active Fiber scheduler" unless Fiber.scheduler
 
-      d.conn.setnonblocking(true)
-      d.conn.enter_pipeline_mode
-      d.socket = d.conn.socket_io
+      connect(d)
+      d.core.enter_pipeline_mode
       d.accepting = true
       d.running = true
 
@@ -162,13 +211,81 @@ module PgPipeline
       raise
     end
 
+    def connect(d)
+      loop do
+        status = d.core.connect_poll
+        case status
+        when :ok
+          break
+        when :reading
+          socket_for(d).wait_readable
+        when :writing
+          socket_for(d).wait_writable
+        when :active
+          Fiber.scheduler&.yield
+        when :failed
+          raise ConnectionLostError, "native connection failed: #{d.core.error_message.to_s.strip}"
+        else
+          raise ProtocolError, "unknown native connect status #{status.inspect}"
+        end
+      end
+
+      if d.core.protocol_version != ServerCaps::PROTOCOL_VERSION
+        raise UnsupportedServerError,
+              "pg_pipeline requires PostgreSQL protocol v3; protocol=#{d.core.protocol_version}"
+      end
+
+      libpq = Native.libpq_version
+      d.instance_variable_set(
+        :@caps, ServerCaps.new(
+          libpq_version: libpq,
+          protocol_version: d.core.protocol_version,
+          pipeline_api: true,
+          fast_sync_api: libpq >= ServerCaps::FAST_SYNC_LIBPQ_VERSION,
+          raw_pipeline_sync_api: true
+        )
+      )
+      d.caps.assert_supported!
+      NativeDriverOps.warn_flush_coupling_once(d.caps)
+      NativeDriverOps.warn_encoding_mismatch_once(d)
+      Native.assert_libpq_compatible!
+      d.socket = socket_for(d)
+    end
+
+    def socket_for(d)
+      descriptor = d.core.socket
+      socket = d.socket
+      return socket if socket && socket.fileno == descriptor
+
+      IO.for_fd(descriptor, autoclose: false)
+    end
+
     def submit(d, request)
       raise ShutdownError, "driver is not accepting work" unless d.accepting
       raise ProtocolError, "request must be new before submit" unless request.state == :new
 
+      if inline_dispatchable?(d)
+        request.queued!
+        d.dispatching = request
+        begin
+          ok = dispatch_unit(d, request)
+          d.dispatching = nil
+          maybe_flush_after_dispatch(d, false) if ok
+        rescue ConnectionLostError => e
+          fatal_close(d, e) if d.running || d.accepting
+          raise_inline_submit_error!(request, e)
+        rescue ProtocolError => e
+          wrapped = ConnectionLostError.new("driver crashed: #{e.class}: #{e.message}")
+          fatal_close(d, wrapped) if d.running || d.accepting
+          raise_inline_submit_error!(request, wrapped)
+        end
+        return request
+      end
+
       d.submitting += 1
       begin
         d.requests.enqueue(request)
+        d.pending += 1
         request.queued!
         notify_requests(d)
       ensure
@@ -177,6 +294,31 @@ module PgPipeline
       end
 
       request
+    end
+
+    def inline_dispatchable?(d)
+      d.running && !d.draining && !d.reader_draining &&
+        d.submitting.zero? && d.dispatching.nil? &&
+        !d.needs_flush && d.requests.empty? &&
+        d.core.inflight_count < d.max_in_flight
+    end
+
+    # Explicit owner wake for an outstanding flush. Not used on the dispatch hot
+    # path (see maybe_flush_after_dispatch); kept as the primitive for callers
+    # that have no in-flight unit to ride on.
+    def notify_flush(d)
+      return if d.flush_event_pending || !d.running
+
+      d.flush_event_pending = true
+      d.flush_event_pending = false if d.events.enqueue(:flush).nil?
+    end
+
+    def raise_inline_submit_error!(request, error)
+      request.reject!(indeterminate_error(error)) unless request.settled?
+      settled = request.error
+      raise settled if settled.is_a?(Exception)
+
+      raise error
     end
 
     def graceful_close(d)
@@ -212,12 +354,13 @@ module PgPipeline
         d.dispatching.nil? &&
         d.submitting.zero? &&
         d.requests.empty? &&
-        d.inflight.length == 1 &&
-        d.inflight.first.equal?(probe)
+        d.core.inflight_count == 1 &&
+        d.core.front_request.equal?(probe)
     end
 
     def owner_loop(d)
       while d.running
+        flush_now(d) if d.flush_pending && d.events.empty?
         event = d.events.dequeue
         break if event.nil?
 
@@ -230,23 +373,16 @@ module PgPipeline
     end
 
     def process_event(d, event)
-      input_changed = false
       case event
       when :requests
         d.request_event_pending = false
-      when :submission_finished
+      when :flush
+        d.flush_event_pending = false
+      when :submission_finished, :drained
         nil
-      when :readable
-        begin
-          d.readable_events += 1
-          read_available(d)
-          input_changed = true
-        ensure
-          d.reader_rearm.enqueue(:rearm) if d.running
-        end
       when :writable
         d.writer_armed = false
-        flush_output(d)
+        flush_now(d)
       when :close
         d.draining = true
       when Array
@@ -257,7 +393,6 @@ module PgPipeline
         end
       end
 
-      drain_results(d) if input_changed
       pump_requests(d) if d.running
       finish_graceful_close(d) if d.running && d.draining && drained?(d)
     end
@@ -271,95 +406,78 @@ module PgPipeline
     end
 
     def pump_requests(d)
-      dispatched = false
-      while d.inflight.size < d.max_in_flight && !d.requests.empty?
+      while d.core.inflight_count < d.max_in_flight && !d.requests.empty?
         request = d.requests.dequeue
         break unless request
+
+        d.pending -= 1 if d.pending.positive?
         next if request.cancelled?
 
         d.dispatching = request
-        unless send_unit(d, request)
+        unless dispatch_unit(d, request)
           d.dispatching = nil
           next
         end
 
-        request.dispatched!
-        d.inflight << request
         d.dispatching = nil
-        d.dispatches += 1
-        dispatched = true
+        maybe_flush_after_dispatch(d, !d.requests.empty?)
       end
 
-      flush_output(d) if dispatched && !d.needs_flush
+      flush_now(d) if d.flush_pending && d.events.empty?
     end
 
-    def send_unit(d, request)
-      begin
-        send_command(d.conn, request)
-      rescue PG::UnableToSend => e
-        d.dispatching = nil
-        request.reject!(
-          NotDispatchedError.new("query was rejected before libpq accepted it: #{e.class}: #{e.message}")
-        )
-        return false if reusable_after_send_rejection?(d)
+    def maybe_flush_after_dispatch(d, more_queued)
+      d.unflushed += 1
+      d.flush_pending = true
+      in_flight = d.core.inflight_count
 
-        raise ConnectionLostError, "dispatch failed: #{e.class}: #{e.message}"
-      rescue PG::Error => e
-        d.dispatching = nil
-        request.reject!(
-          NotDispatchedError.new("query was rejected before libpq accepted it: #{e.class}: #{e.message}")
-        )
-        raise ConnectionLostError, "dispatch failed: #{e.class}: #{e.message}"
-      rescue ProtocolError
-        raise
-      rescue StandardError => e
-        request.reject!(e)
-        return false
-      end
+      alone = in_flight <= 1 && !more_queued
+      nothing_on_wire = !more_queued && d.unflushed >= in_flight
+      full_batch = d.unflushed >= NativeConnectionDriver::FLUSH_THRESHOLD
 
-      d.caps.place_sync(d.conn)
+      flush_now(d) if alone || nothing_on_wire || full_batch
+    end
+
+    def flush_now(d)
+      d.flush_pending = false
+      d.unflushed = 0
+      flush_output(d)
+    end
+
+    def dispatch_unit(d, request)
+      d.core.dispatch(request)
       true
-    rescue PG::Error => e
-      raise ConnectionLostError, "dispatch Sync failed: #{e.class}: #{e.message}"
-    end
+    rescue NotDispatchedError => e
+      d.dispatching = nil
+      request.reject!(e)
+      return false if d.core.reusable?
 
-    def send_command(conn, request)
-      case request.operation
-      when :query
-        conn.send_query_params(request.sql, request.params)
-      when :prepare
-        if request.param_types.nil?
-          conn.send_prepare(request.statement_name, request.sql)
-        else
-          conn.send_prepare(request.statement_name, request.sql, request.param_types)
-        end
-      when :prepared_query
-        conn.send_query_prepared(request.statement_name, request.params)
-      else
-        raise ProtocolError, "unsupported request operation #{request.operation.inspect}"
-      end
-    end
-
-    def reusable_after_send_rejection?(d)
-      !d.conn.finished? &&
-        d.conn.status == PG::CONNECTION_OK &&
-        d.conn.pipeline_status != PG::PQ_PIPELINE_OFF
-    rescue PG::Error
+      raise ConnectionLostError, "dispatch failed: #{e.message}"
+    rescue UnsupportedServerError => e
+      d.dispatching = nil
+      request.reject!(e)
+      false
+    rescue ConnectionLostError
+      raise
+    rescue ProtocolError
+      raise
+    rescue StandardError => e
+      request.reject!(e)
       false
     end
 
     def flush_output(d)
       return unless d.running
 
-      d.flush_calls += 1
-      if d.conn.sync_flush
+      if d.core.flush
         d.needs_flush = false
       else
         d.needs_flush = true
-        d.flush_incomplete += 1
         arm_writer(d)
       end
-    rescue PG::Error => e
+    rescue ConnectionLostError
+      raise
+    rescue StandardError => e
       raise ConnectionLostError, "flush failed: #{e.class}: #{e.message}"
     end
 
@@ -371,93 +489,26 @@ module PgPipeline
       d.writer_commands.enqueue(:wait_writable)
     end
 
-    def read_available(d)
-      d.conn.consume_input
-    rescue PG::Error => e
-      raise ConnectionLostError, "read failed: #{e.class}: #{e.message}"
-    end
-
-    def drain_results(d)
-      read = 0
-
-      begin
-        while !d.inflight.empty? && !d.conn.is_busy
-          result = d.conn.sync_get_result
-          read += 1
-          request = d.inflight.first
-          raise ProtocolError, "result without an in-flight request" unless request
-
-          if result.nil?
-            request.query_boundary!
-            next
-          end
-
-          status = result.result_status
-          case status
-          when PG::PGRES_TUPLES_OK
-            ensure_before_query_boundary!(request, status)
-            request.accept_result(result)
-          when PG::PGRES_PIPELINE_SYNC
-            clear_result(result)
-            complete_front(d, request)
-          when PG::PGRES_COMMAND_OK, PG::PGRES_EMPTY_QUERY
-            ensure_before_query_boundary!(request, status)
-            request.accept_result(result)
-          when PG::PGRES_FATAL_ERROR
-            ensure_before_query_boundary!(request, status)
-            request.record_error!(query_error(result), result: result)
-          when PG::PGRES_PIPELINE_ABORTED
-            ensure_before_query_boundary!(request, status)
-            clear_result(result)
-            request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
-          when PG::PGRES_BAD_RESPONSE
-            clear_result(result)
-            raise ProtocolError, "server response was not understood"
-          when PG::PGRES_COPY_IN, PG::PGRES_COPY_OUT, PG::PGRES_COPY_BOTH
-            clear_result(result)
-            raise ProtocolError, "COPY is not supported on the multiplexed pipeline"
-          else
-            clear_result(result)
-            raise ProtocolError, "unexpected pipeline result status #{status}"
-          end
-        end
-      ensure
-        d.results_read += read if read.positive?
-      end
-    end
-
-    def ensure_before_query_boundary!(request, status)
-      return unless request.query_boundary_seen?
-
-      raise ProtocolError, "result status #{status} arrived after query boundary"
-    end
-
-    def complete_front(d, request)
-      raise ProtocolError, "sync does not match FIFO front" unless request.equal?(d.inflight.first)
-
-      d.inflight.shift
-      d.units_completed += 1
-      request.finish!
-    end
-
-    def query_error(result)
-      message = result.error_message.to_s.strip
-      message = "query failed" if message.empty?
-      QueryError.new(message, cause_result: result)
-    end
-
     def drained?(d)
-      d.submitting.zero? && d.requests.empty? && d.inflight.empty? && !d.needs_flush && d.dispatching.nil?
+      d.submitting.zero? &&
+        d.requests.empty? &&
+        d.core.inflight_count.zero? &&
+        !d.needs_flush &&
+        !d.flush_pending &&
+        d.dispatching.nil?
     end
 
     def finish_graceful_close(d)
       d.accepting = false
       d.running = false
-      d.conn.exit_pipeline_mode
-    rescue PG::Error => e
-      fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
-    ensure
-      teardown_watchers(d)
+
+      begin
+        d.core.exit_pipeline_mode
+      rescue StandardError => e
+        fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
+      ensure
+        teardown_watchers(d)
+      end
     end
 
     def fatal_close(d, error)
@@ -467,15 +518,17 @@ module PgPipeline
       d.running = false
       d.requests.close(not_dispatched_error(error))
       fail_all(d, error)
-
       teardown_watchers(d)
     end
 
     def fail_all(d, error)
       uncertain = []
       uncertain << d.dispatching if d.dispatching
-      uncertain.concat(d.inflight)
+      uncertain.concat(d.core.take_inflight)
       queued = d.requests.drain
+      d.pending = 0
+      d.unflushed = 0
+      d.flush_pending = false
 
       uncertain.compact.uniq.each do |request|
         request.reject!(indeterminate_error(error)) unless request.settled?
@@ -486,7 +539,6 @@ module PgPipeline
       end
 
       d.dispatching = nil
-      d.inflight.clear
     end
 
     def not_dispatched_error(error)
@@ -531,9 +583,23 @@ module PgPipeline
       while d.running
         break unless wait_socket_readable(d, timeout)
 
-        d.events.enqueue(:readable)
-        command = d.reader_rearm.dequeue
-        break unless command == :rearm && d.running
+        begin
+          d.reader_draining = true
+          d.core.consume_and_drain
+        rescue StandardError => e
+          if d.running
+            d.events.enqueue(
+              [:abort, ConnectionLostError.new("reader drain failed: #{e.class}: #{e.message}")]
+            )
+          end
+          break
+        ensure
+          d.reader_draining = false
+        end
+
+        if d.running && (!d.requests.empty? || d.flush_pending || d.draining)
+          d.events.enqueue(:drained)
+        end
       end
     rescue StandardError => e
       if d.running
@@ -568,7 +634,7 @@ module PgPipeline
       stop_watchers(tasks)
       join_watchers(d, tasks)
       d.socket = nil
-      safe_close_conn(d)
+      safe_close_core(d)
       nil
     end
 
@@ -638,14 +704,10 @@ module PgPipeline
       )
     end
 
-    def safe_close_conn(d)
-      d.conn.close unless d.conn.finished?
+    def safe_close_core(d)
+      d.core.close unless d.core.closed?
     rescue StandardError
       nil
-    end
-
-    def clear_result(result)
-      result.clear if result.respond_to?(:clear)
     end
   end
 end
