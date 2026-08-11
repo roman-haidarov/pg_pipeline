@@ -7,15 +7,15 @@ Gem::Specification.new do |spec|
   spec.version = PgPipeline::VERSION
   spec.authors = ["Roman Hajdarov"]
   spec.email   = ["romanhajdarov@gmail.com"]
-  spec.summary = "Fiber-scheduler PostgreSQL pipeline multiplexing on top of ruby-pg"
+  spec.summary = "Fiber-scheduler PostgreSQL pipeline multiplexing with a native libpq core"
   spec.description = <<~DESC
-    A driver-adjacent Ruby control-plane over ruby-pg/libpq. It multiplexes
-    independent, session-neutral extended-protocol operations from many fibers
-    onto a small number of PostgreSQL connections while keeping explicit
-    transactions and session-changing work on exclusive pinned connections.
-    Requires any Fiber::Scheduler host (Async::Scheduler, Itsi::Scheduler, …);
-    the gem does not depend on a particular reactor. Control-plane only: all
-    wire work stays in libpq.
+    A driver-adjacent control plane over libpq. It multiplexes independent,
+    session-neutral extended-protocol operations from many fibers onto a small
+    number of PostgreSQL connections while keeping explicit transactions and
+    session-changing work on exclusive pinned connections. Requires any
+    Fiber::Scheduler host (Async::Scheduler, Itsi::Scheduler, …). Version 0.4
+    moves the multiplexed data plane (request state, PGresult ownership,
+    send/flush/drain) into a C extension; behaviour matches 0.3.1.
   DESC
   spec.homepage = "https://github.com/roman-haidarov/pg_pipeline"
   spec.license  = "MIT"
@@ -30,8 +30,17 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "pg", ">= 1.5", "< 2"
 
-  spec.files = Dir["lib/**/*.rb", "README.md", "DESIGN.md", "LICENSE.txt", "CHANGELOG.md"]
+  spec.files = Dir[
+    "lib/**/*.rb",
+    "ext/**/*.{c,h,rb}",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE.txt",
+    "CHANGELOG.md",
+    "docs/**/*.md"
+  ]
   spec.require_paths = ["lib"]
+  spec.extensions = ["ext/pg_pipeline_native/extconf.rb"]
 
   spec.add_development_dependency "async", "~> 2.42"
   spec.add_development_dependency "rake", "~> 13.0"

@@ -4,7 +4,7 @@ require "pg"
 
 require_relative "errors"
 require_relative "runtime"
-require_relative "connection_driver"
+require_relative "native_connection_driver"
 require_relative "prepared_statement"
 require_relative "server_caps"
 
@@ -26,20 +26,23 @@ module PgPipeline
     def initialize(connection_args,
                    pipeline_size: DEFAULT_PIPELINE_SIZE,
                    pinned_size: DEFAULT_PINNED_SIZE,
-                   max_pending: ConnectionDriver::DEFAULT_MAX_PENDING,
-                   max_in_flight: ConnectionDriver::DEFAULT_MAX_IN_FLIGHT,
+                   max_pending: NativeConnectionDriver::DEFAULT_MAX_PENDING,
+                   max_in_flight: NativeConnectionDriver::DEFAULT_MAX_IN_FLIGHT,
                    reconnect: true,
                    reconnect_interval: DEFAULT_RECONNECT_INTERVAL,
                    reconnect_backoff_max: DEFAULT_RECONNECT_BACKOFF_MAX,
                    health_check: true,
                    health_interval: DEFAULT_HEALTH_INTERVAL,
                    health_timeout: DEFAULT_HEALTH_TIMEOUT,
-                   cancel_pinned_on_abort: true)
+                   cancel_pinned_on_abort: true,
+                   **removed)
+      PoolOps.reject_removed_options!(removed)
       @connection_args = connection_args
       @pipeline_size = PoolOps.positive_integer!(pipeline_size, :pipeline_size)
       @pinned_size = PoolOps.nonnegative_integer!(pinned_size, :pinned_size)
       @max_pending = max_pending
       @max_in_flight = max_in_flight
+      Native.assert_libpq_compatible!
       @reconnect = reconnect
       @reconnect_interval = PoolOps.finite_float!(reconnect_interval, :reconnect_interval)
       @reconnect_backoff_max = PoolOps.finite_float!(reconnect_backoff_max, :reconnect_backoff_max)
@@ -105,6 +108,13 @@ module PgPipeline
 
     def pipeline_driver
       ensure_available!
+
+      if @pipeline_size == 1
+        driver = @drivers[0]
+        raise NotDispatchedError, "no live pipeline connections; request was not dispatched" unless driver&.available?
+
+        return driver
+      end
 
       driver = PoolOps.select_driver_into(@drivers, @rr, @rr_slot)
       @rr = @rr_slot[0]
@@ -207,6 +217,10 @@ module PgPipeline
         pipeline: {
           size: @pipeline_size,
           live: @drivers.count(&:available?),
+          # Process-wide, not pool-wide: payloads are sealed before a driver is
+          # chosen, so this is the encoding every multiplexed connection in the
+          # process must agree on. Compare against each driver's :encoding.
+          seal_encoding: Native.seal_encoding_published? ? Native.seal_encoding.name : nil,
           drivers: @drivers.map(&:stats)
         },
         pinned: {
@@ -451,16 +465,22 @@ module PgPipeline
     end
 
     def start_pipeline_driver
-      conn = PoolOps.new_connection(@connection_args)
-      prepare_registered_statements(conn)
-      driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight)
+      driver = NativeConnectionDriver.new(
+        @connection_args, max_pending: @max_pending, max_in_flight: @max_in_flight
+      )
       driver.start
+      prepare_registered_statements_on_driver(driver)
+      driver
     rescue Exception
-      PoolOps.safe_close(conn) if conn
+      begin
+        driver&.abort!
+      rescue StandardError
+        nil
+      end
       raise
     end
 
-    def prepare_registered_statements(conn)
+    def prepare_registered_statements_on_driver(driver)
       prepared = {}
 
       loop do
@@ -470,13 +490,14 @@ module PgPipeline
         statements.each do |statement|
           next if prepared.key?(statement.physical_name)
 
-          result = if statement.param_types.nil?
-                     conn.prepare(statement.physical_name, statement.sql)
-                   else
-                     conn.prepare(statement.physical_name, statement.sql, statement.param_types)
-                   end
-          RequestOps.clear_result(result)
-          prepared[statement.physical_name] = true
+          request = Request.prepare(statement)
+          begin
+            driver.submit(request)
+            RequestOps.clear_result(request.wait)
+            prepared[statement.physical_name] = true
+          ensure
+            request.cancel! unless request.settled?
+          end
         end
 
         break if generation == (@prepared_generation || 0)
@@ -564,6 +585,29 @@ module PgPipeline
   module PoolOps
     module_function
 
+    # 0.4 deleted the pure-Ruby multiplexed driver, so `backend:` has no meaning
+    # any more. Ruby's own "unknown keyword: :backend" says nothing about where
+    # it went or what to do, and this is the one option a 0.3 caller is likely
+    # to have set explicitly.
+    REMOVED_OPTIONS = {
+      backend: "removed in 0.4.0: the pure-Ruby multiplexed driver is gone and " \
+               "libpq is now driven only from C on the multiplexed path. There is " \
+               "no compiler-free fallback; pin pg_pipeline ~> 0.3.1 if you need one."
+    }.freeze
+
+    def reject_removed_options!(options)
+      return if options.empty?
+
+      known = options.keys & REMOVED_OPTIONS.keys
+      unless known.empty?
+        raise ArgumentError,
+              known.map { |key| "#{key}: #{REMOVED_OPTIONS.fetch(key)}" }.join("; ")
+      end
+
+      raise ArgumentError, "unknown keyword#{"s" if options.size > 1}: " \
+                           "#{options.keys.map(&:inspect).join(", ")}"
+    end
+
     def positive_integer!(value, name)
       integer = Integer(value)
       raise ArgumentError, "#{name} must be >= 1" if integer < 1
@@ -614,6 +658,10 @@ module PgPipeline
         next unless driver.available?
 
         load = driver.load
+        if load.zero?
+          slot[0] = (index + 1) % size
+          return driver
+        end
         next unless best.nil? || load < best_load
 
         best = driver

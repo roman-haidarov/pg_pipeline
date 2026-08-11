@@ -1,30 +1,31 @@
 # frozen_string_literal: true
 
 require_relative "errors"
+require_relative "native"
 
 module PgPipeline
-  class Request
-    attr_reader :sql, :params
-    attr_accessor :state, :cancelled, :settled, :result_seen, :query_boundary_seen,
-                  :result, :error, :waiter, :waiter_scheduler
+  class Request < Native::RequestState
+    attr_reader :sql
+
+    alias native_transition! transition!
+    alias native_accept_result accept_result
+    alias native_record_error! record_error!
+    alias native_query_boundary! query_boundary!
+    alias native_finish! finish!
+    alias native_reject! reject!
+    alias native_cancel! cancel!
+    alias native_wait wait
+    alias native_seal! seal!
+    alias native_adopt_payload! adopt_payload!
 
     def initialize(sql:, params: nil)
-      @sql = RequestOps.snapshot_sql(sql)
-      @params = RequestOps.snapshot_params(params)
-      @state = :new
-      @cancelled = false
-      @settled = false
-      @result_seen = false
-      @query_boundary_seen = false
-      @result = nil
-      @error = nil
-      @waiter = nil
-      @waiter_scheduler = nil
+      super()
+      build_sealed!(sql, params)
     end
 
-    def self.build(sql, params)
+    def self.build(sql, params, snapped_sql: false)
       request = allocate
-      request.__send__(:init_query, sql, params)
+      request.__send__(:build_sealed!, sql, params, snapped_sql: snapped_sql)
       request
     end
 
@@ -35,35 +36,53 @@ module PgPipeline
     end
 
     def operation = :query
+    def statement_name = nil
+    def param_types = nil
 
-    def queued! = RequestOps.transition!(self, :new, :queued)
-    def dispatched! = RequestOps.transition!(self, :queued, :dispatched)
-    def accept_result(result) = RequestOps.accept_result(self, result)
-    def record_error!(error, result: nil) = RequestOps.record_error!(self, error, result)
-    def query_boundary! = RequestOps.query_boundary!(self)
-    def finish! = RequestOps.finish!(self)
-    def reject!(error) = RequestOps.reject!(self, error)
-    def cancel! = RequestOps.cancel!(self)
-    def wait = RequestOps.wait(self)
+    def respawn
+      copy = self.class.allocate
+      copy.__send__(:adopt_from, self)
+      copy
+    end
 
-    def query_boundary_seen? = @query_boundary_seen
-    def cancelled? = @cancelled
-    def settled? = @settled
+    def queued! = native_transition!(:new, :queued)
+    def dispatched! = native_transition!(:queued, :dispatched)
+    def accept_result(result) = native_accept_result(result)
+    def record_error!(error, result: nil) = native_record_error!(error, result)
+    def query_boundary! = native_query_boundary!
+    def finish! = native_finish!(self)
+    def reject!(error) = native_reject!(self, error)
+    def cancel! = native_cancel!
+    def wait = native_wait(self)
+
+    def query_boundary_seen? = query_boundary_seen
+    def cancelled? = cancelled
+    def settled? = settled
+
+    private :native_transition!, :native_accept_result, :native_record_error!,
+            :native_query_boundary!, :native_finish!, :native_reject!,
+            :native_cancel!, :native_wait, :native_seal!, :native_adopt_payload!
 
     private
 
+    def build_sealed!(sql, params, snapped_sql: false)
+      @sql = snapped_sql ? sql : RequestOps.snapshot_sql(sql)
+      seal!(RequestOps.validate_params!(params))
+    end
+
     def init_query(sql, params)
       @sql = RequestOps.snapshot_sql(sql)
-      @params = RequestOps.snapshot_params(params)
-      @state = :new
-      @cancelled = false
-      @settled = false
-      @result_seen = false
-      @query_boundary_seen = false
-      @result = nil
-      @error = nil
-      @waiter = nil
-      @waiter_scheduler = nil
+      RequestOps.validate_params!(params)
+    end
+
+    def seal!(params)
+      native_seal!(operation, @sql, params, statement_name, param_types)
+      self
+    end
+
+    def adopt_from(origin)
+      @sql = origin.sql
+      native_adopt_payload!(origin)
       self
     end
   end
@@ -72,25 +91,33 @@ module PgPipeline
     attr_reader :statement_name, :param_types
 
     def initialize(statement)
-      super(sql: statement.sql)
       @statement_name = RequestOps.snapshot_name(statement.physical_name)
       @param_types = RequestOps.snapshot_param_types(statement.param_types)
+      super(sql: statement.sql)
     end
 
     def operation = :prepare
+
+    private
+
+    def adopt_from(origin)
+      @statement_name = origin.statement_name
+      @param_types = origin.param_types
+      super
+    end
   end
 
   class PreparedQueryRequest < Request
     attr_reader :statement_name
 
     def initialize(statement, params: nil)
-      super(sql: statement.sql, params: params)
       @statement_name = RequestOps.snapshot_name(statement.physical_name)
+      super(sql: statement.sql, params: params)
     end
 
     def self.build(statement, params)
       request = allocate
-      request.__send__(:init_prepared, statement, params)
+      request.__send__(:build_prepared_sealed!, statement, params)
       request
     end
 
@@ -98,10 +125,19 @@ module PgPipeline
 
     private
 
-    def init_prepared(statement, params)
-      init_query(statement.sql, params)
+    def build_prepared_sealed!(statement, params)
       @statement_name = RequestOps.snapshot_name(statement.physical_name)
-      self
+      build_sealed!(statement.sql, params, snapped_sql: true)
+    end
+
+    def init_prepared(statement, params)
+      @statement_name = RequestOps.snapshot_name(statement.physical_name)
+      init_query(statement.sql, params)
+    end
+
+    def adopt_from(origin)
+      @statement_name = origin.statement_name
+      super
     end
   end
 
@@ -115,45 +151,11 @@ module PgPipeline
 
     EMPTY_PARAMS = [].freeze
 
-    def snapshot_params(params)
+    def validate_params!(params)
       return EMPTY_PARAMS if params.nil?
       raise ArgumentError, "params must be an Array" unless params.is_a?(Array)
-      return EMPTY_PARAMS if params.empty?
 
-      return params if params.frozen? && immutable_values?(params)
-
-      params.map { |value| snapshot_value(value) }.freeze
-    end
-
-    def immutable_values?(values)
-      index = 0
-      size = values.size
-      while index < size
-        value = values[index]
-        case value
-        when Integer, Float, Symbol, NilClass, TrueClass, FalseClass
-          nil
-        when String
-          return false unless value.frozen?
-        else
-          return false
-        end
-        index += 1
-      end
-      true
-    end
-
-    def snapshot_value(value)
-      case value
-      when String
-        value.frozen? ? value : value.dup.freeze
-      when Hash
-        value.each_with_object({}) do |(key, item), copy|
-          copy[key] = item.is_a?(String) && !item.frozen? ? item.dup.freeze : item
-        end.freeze
-      else
-        value
-      end
+      params
     end
 
     def snapshot_name(name)
@@ -167,116 +169,33 @@ module PgPipeline
       return nil if param_types.nil?
       raise ArgumentError, "param_types must be an Array or nil" unless param_types.is_a?(Array)
 
-      param_types.map { |oid| oid.nil? ? nil : Integer(oid) }.freeze
-    rescue ArgumentError, TypeError
-      raise ArgumentError, "param_types must contain only integer OIDs or nil"
+      param_types.map { |oid| snapshot_param_oid(oid) }.freeze
     end
 
-    def transition!(req, from, to)
-      unless req.state == from
-        raise ProtocolError, "invalid request transition #{req.state.inspect} -> #{to.inspect}"
+    def snapshot_param_oid(oid)
+      return if oid.nil?
+
+      value = begin
+        Integer(oid)
+      rescue ArgumentError, TypeError
+        raise ArgumentError, "param_types must contain only integer OIDs or nil"
       end
 
-      req.state = to
-    end
-
-    def accept_result(req, result)
-      assert_result_slot!(req)
-      req.result_seen = true
-
-      if req.cancelled
-        clear_result(result)
-      else
-        req.result = result
+      unless value.between?(0, 0xffff_ffff)
+        raise ArgumentError, "PostgreSQL OIDs must be between 0 and 4294967295"
       end
+
+      value
     end
 
-    def record_error!(req, error, result)
-      assert_result_slot!(req)
-      req.result_seen = true
-
-      if req.cancelled
-        clear_result(result)
-      else
-        req.error ||= error
-      end
-    end
-
-    def query_boundary!(req)
-      raise ProtocolError, "query boundary before query result" unless req.result_seen
-      raise ProtocolError, "duplicate query boundary" if req.query_boundary_seen
-
-      req.query_boundary_seen = true
-    end
-
-    def finish!(req)
-      raise ProtocolError, "sync arrived before query boundary" unless req.query_boundary_seen
-      return if req.settled
-
-      req.settled = true
-      req.state = :done
-      wake_waiter(req) unless req.cancelled
-    end
-
-    def reject!(req, error)
-      return if req.settled
-
-      clear_result(req.result)
-      req.result = nil
-      req.error ||= error
-      req.settled = true
-      req.state = :done
-      wake_waiter(req) unless req.cancelled
-    end
-
-    def cancel!(req)
-      return if req.cancelled
-
-      req.cancelled = true
-      clear_result(req.result)
-      req.result = nil
-      req.error.clear_result! if req.error.respond_to?(:clear_result!)
-    end
-
-    def wait(req)
-      park_waiter(req) unless req.settled
-      raise req.error if req.error
-
-      req.result
-    end
-
-    def park_waiter(req)
-      raise ProtocolError, "request already has a waiter" if req.waiter
-
-      scheduler = Fiber.scheduler
-      raise Error, "request wait requires an active Fiber scheduler" unless scheduler
-
-      waiter = Fiber.current
-      req.waiter = waiter
-      req.waiter_scheduler = scheduler
-
-      scheduler.block(req, nil) until req.settled
-    ensure
-      if waiter && req.waiter.equal?(waiter)
-        req.waiter = nil
-        req.waiter_scheduler = nil
-      end
-    end
-
-    def wake_waiter(req)
-      waiter = req.waiter
-      scheduler = req.waiter_scheduler
-
-      req.waiter = nil
-      req.waiter_scheduler = nil
-
-      scheduler.unblock(req, waiter) if scheduler && waiter
-    end
-
-    def assert_result_slot!(req)
-      raise ProtocolError, "result arrived after query boundary" if req.query_boundary_seen
-      raise ProtocolError, "multiple results for one pipeline unit" if req.result_seen
-    end
+    def transition!(req, from, to) = req.__send__(:native_transition!, from, to)
+    def accept_result(req, result) = req.__send__(:native_accept_result, result)
+    def record_error!(req, error, result) = req.__send__(:native_record_error!, error, result)
+    def query_boundary!(req) = req.__send__(:native_query_boundary!)
+    def finish!(req) = req.__send__(:native_finish!, req)
+    def reject!(req, error) = req.__send__(:native_reject!, req, error)
+    def cancel!(req) = req.__send__(:native_cancel!)
+    def wait(req) = req.__send__(:native_wait, req)
 
     def clear_result(result)
       result.clear if result.respond_to?(:clear)

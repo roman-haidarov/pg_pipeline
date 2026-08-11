@@ -6,7 +6,7 @@ require "async"
 RSpec.describe "watcher wait timeout selection" do
   after { Fiber.set_scheduler(nil) if Fiber.respond_to?(:set_scheduler) }
 
-  describe PgPipeline::DriverOps do
+  describe PgPipeline::NativeDriverOps do
     it "uses the zero-overhead io_wait fast path (no timeout) when the scheduler " \
        "implements #fiber_interrupt, e.g. Async and Itsi" do
       scheduler = Struct.new(:x) { def fiber_interrupt(*); end }.new(nil)
@@ -73,10 +73,9 @@ RSpec.describe "watcher wait timeout selection" do
 
     Sync do
       task = PgPipeline::Runtime.spawn(name: :reader_regression) do
-        PgPipeline::DriverOps.reader_watcher(driver)
+        PgPipeline::NativeDriverOps.reader_watcher(driver)
       end
 
-      # Give the watcher a chance to actually enter wait_readable before we stop it.
       sleep 0.01
       driver.running = false
       task.stop

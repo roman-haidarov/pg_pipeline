@@ -185,25 +185,25 @@ end
       t.finished? && n.signal == false
     end
 
-    check "the gem calls ONLY block/unblock on the scheduler" do
-      allowed = %w[block unblock equal? nil? respond_to?]
+    check "the gem only uses Fiber::Scheduler hooks block/unblock/fiber_interrupt/yield" do
+      allowed = %w[block unblock fiber_interrupt yield equal? nil? respond_to?]
       root = File.expand_path("../lib", __dir__)
       offenders = Dir[File.join(root, "**/*.rb")].flat_map do |path|
         File.readlines(path).each_with_index.filter_map do |line, i|
           next if line =~ /^\s*#/
           name = line[/(?:Fiber\.scheduler|@?scheduler)\.(\w+\??)/, 1]
           next if name.nil? || allowed.include?(name)
-          "#{path.sub(root + '/', '')}:#{i + 1} -> #{name}"
+          "#{path.sub(root + "/", "")}:#{i + 1} -> #{name}"
         end
       end
       offenders.each { |o| puts "        #{o}" }
       offenders.empty?
     end
 
-    check "Fiber#raise never reaches a fiber parked by Runtime.park" do
+    check "Task#stop uses fiber_interrupt, not Fiber#raise, to interrupt work" do
       source = File.read(File.expand_path("../lib/pg_pipeline/runtime/task.rb", __dir__))
       body = source[/def interrupt_fiber.*?\n      end/m].to_s
-      body.include?("return false if @blocker") && body.include?("fiber.raise")
+      body.include?("fiber_interrupt") && !body.include?("fiber.raise")
     end
 
     check "bounded waits never invoke the timeout_after hook with bad arity" do

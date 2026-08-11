@@ -1,5 +1,50 @@
 # frozen_string_literal: true
 
+require "rbconfig"
+require "fileutils"
+
+include FileUtils
+
+EXT_DIR = File.expand_path("ext/pg_pipeline_native", __dir__)
+
+# Object files and shared objects are build products and are not tracked. If a
+# checkout still carries them from an older revision, `rake clean compile` will
+# clear them out -- but they must never come back into git, or a clone on a
+# different platform loads a foreign binary.
+BUILD_PRODUCTS = "*.{o,so,bundle,dylib}"
+
+desc "Compile the native libpq extension"
+task :compile do
+  Dir.chdir(EXT_DIR) do
+    # Never link leftover objects: a git checkout or shared worktree may carry
+    # macOS .o/.bundle into a Linux CI job ("file format not recognized").
+    # Always drop products before make so sources recompile for this platform.
+    rm_f Dir[BUILD_PRODUCTS]
+    rm_rf Dir["*.dSYM"]
+
+    stale_makefile = File.file?("Makefile") &&
+                     !File.read("Makefile").include?(RbConfig::CONFIG.fetch("arch"))
+    if stale_makefile
+      rm_f "Makefile"
+      rm_f "mkmf.log"
+    end
+
+    sh RbConfig.ruby, "extconf.rb" unless File.file?("Makefile")
+    sh ENV.fetch("MAKE", "make")
+  end
+end
+
+desc "Remove native build products and force extconf to run again"
+task :clean do
+  Dir.chdir(EXT_DIR) do
+    sh ENV.fetch("MAKE", "make"), "clean" if File.file?("Makefile")
+    rm_f "Makefile"
+    rm_f "mkmf.log"
+    rm_f Dir[BUILD_PRODUCTS]
+    rm_rf Dir["*.dSYM"]
+  end
+end
+
 begin
   require "rspec/core/rake_task"
   RSpec::Core::RakeTask.new(:spec) do |t|
@@ -10,6 +55,25 @@ begin
   end
 rescue LoadError
   nil
+end
+
+# Both suites need the extension. Only :spec used to depend on :compile, so
+# `rake integration` could silently run against a stale build -- exactly the
+# suite where that matters most.
+Rake::Task[:spec].enhance([:compile]) if Rake::Task.task_defined?(:spec)
+Rake::Task[:integration].enhance([:compile]) if Rake::Task.task_defined?(:integration)
+task test: :spec
+
+desc "Fail if a build product was ever committed"
+task :verify_no_build_products do
+  tracked = `git ls-files ext`.split("\n").grep(/\.(o|so|bundle|dylib)\z/)
+  next if tracked.empty?
+
+  abort <<~MSG
+    These build products are tracked in git and must not be:
+      #{tracked.join("\n  ")}
+    Remove them with: git rm --cached #{tracked.join(" ")}
+  MSG
 end
 
 namespace :bench do
@@ -29,6 +93,7 @@ namespace :bench do
       bench:throughput   N-fiber thrpt/p99 on pg_pipeline
       bench:ab           pipeline vs naive pool A/B (+ server_conns)
       bench:smoke        multi-worker connection occupancy
+      bench:dispatch     isolated send-path cost by parameter width
       bench:profile      RubyProf CI-shaped scenario → tmp/bench_kit/
       bench:metrics      full picture: cpu+alloc+sampling+GC → tmp/bench_kit/
       bench:all          rtt_demo + throughput + smoke (needs PG_PIPELINE_URL for last two)
@@ -63,6 +128,11 @@ namespace :bench do
   desc "Multi-worker connection smoke (needs PG_PIPELINE_URL)"
   task :smoke do
     bench_ruby "multiworker_smoke.rb"
+  end
+
+  desc "Isolated send-path cost per parameter width (needs PG_PIPELINE_URL)"
+  task :dispatch do
+    bench_ruby "dispatch_cost.rb"
   end
 
   desc "RubyProf CI-shaped scenario (needs PG_PIPELINE_URL) → tmp/bench_kit/"

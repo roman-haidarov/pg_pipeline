@@ -74,7 +74,7 @@ module PgPipeline
       SessionGuard.assert_multiplexable_normalized!(sql, mode: client.guard)
 
       wait_for_request do
-        submit_with_failover(client) { Request.build(sql, params) }
+        submit_with_failover(client, Request.build(sql, params, snapped_sql: true))
       end
     end
 
@@ -89,7 +89,7 @@ module PgPipeline
       ensure_started!(client)
 
       wait_for_request do
-        submit_with_failover(client) { Request.prepared_query(statement, params: params) }
+        submit_with_failover(client, Request.prepared_query(statement, params: params))
       end
     end
 
@@ -100,13 +100,12 @@ module PgPipeline
       request.cancel! if request && !request.settled?
     end
 
-    def submit_with_failover(client)
+    def submit_with_failover(client, request)
       attempts = 0
       limit = [pool(client).pipeline_size, 1].max
       last_error = nil
 
       while attempts < limit
-        request = yield
         begin
           pool(client).__send__(:pipeline_driver).submit(request)
           return request
@@ -117,7 +116,11 @@ module PgPipeline
           last_error = e
           attempts += 1
           break unless request.state == :new && !request.settled?
+        rescue IndeterminateResultError
+          raise
         end
+
+        request = request.respawn if attempts < limit
       end
 
       error = last_error || NotDispatchedError.new("no live pipeline connections; request was not dispatched")

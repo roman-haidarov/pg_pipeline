@@ -2,8 +2,10 @@
 
 ## 1. Scope
 
-`pg_pipeline` is a driver-adjacent Ruby control plane over `ruby-pg`. It does not
-parse the wire protocol and does not replace libpq.
+`pg_pipeline` is a driver-adjacent control plane over libpq. The multiplexed
+data plane (0.4+) lives in a C extension; the control plane remains Ruby on
+`Fiber::Scheduler`. It does not parse the wire protocol and does not replace
+libpq. Pinned sessions still use `ruby-pg`.
 
 The target workload is many concurrent Async/Falcon fibers issuing independent
 small/medium PostgreSQL operations where RTT and/or connection count matter.
@@ -12,12 +14,13 @@ Pipeline mode does not parallelize execution inside one PostgreSQL backend.
 ## 2. Non-negotiable ownership invariant
 
 ```text
-one ConnectionDriver == one PG::Connection == one task that calls it
+one multiplexed driver == one PGconn owned by the C core
+                      == one owner task that alone drives libpq on that connection
 ```
 
-The owner task is the only code allowed to call `PG::Connection` methods.
-Reader/writer watcher tasks only wait on the memoized socket IO and enqueue
-readiness events.
+The owner task is the only code allowed to call libpq on that connection
+(via the C core or ruby-pg). Reader/writer watcher tasks only wait on the
+memoized socket IO and enqueue readiness events.
 
 This avoids concurrent mutation of libpq protocol state while still giving the
 owner three wakeup sources:
@@ -59,6 +62,63 @@ not poll `is_busy` again: without a new `consume_input` they cannot reveal new
 server input, and the redundant Ruby-to-C calls were the largest control-plane
 CPU hot spot in profiling.
 
+## 3a. Where the Ruby/C boundary sits, and why
+
+The boundary is not "as much as possible in C". It is drawn at one line:
+
+```text
+per-request or per-result work  -> C
+per-batch or per-connection work -> Ruby
+```
+
+Everything on the left is paid once per query and shows up linearly in a
+profile: parameter encoding, `PQsend*`, Sync, drain, result ownership, request
+settle, counters. All of it lives in the extension, and `dispatch`
+performs no `rb_funcall` at all -- the accessor IDs it once used were deleted
+from the extension so the dependency cannot creep back in.
+
+Everything on the right is amortised across a whole readable event (up to
+`max_in_flight` requests) or across the lifetime of a connection: the owner
+loop, the reader/writer watchers, BoundedQueue, the pool supervisor, health
+checks, `SessionGuard`, sessions and transactions. Moving those into C would
+mean reimplementing `Fiber::Scheduler` interop in C for no measurable gain,
+and it would cost the property that makes this gem worth using: the control
+plane runs on *any* scheduler, and stays readable and debuggable in Ruby.
+
+### Sealed payloads
+
+`Request` is `TypedData`-backed by `Native::RequestState`. Its constructor calls
+`seal!`, which copies operation, SQL, statement name, parameter bodies, formats
+and OIDs into a single arena allocation laid out as:
+
+```text
+[ values[] ][ types[] ][ lengths[] ][ formats[] ][ sql\0 name\0 param0\0 param1\0 ... ]
+```
+
+`values[i]` points into the text region of the same allocation. `dispatch` then
+hands those pointers straight to libpq.
+
+Two consequences worth stating explicitly:
+
+- **Bodies are copied, not borrowed.** GC compaction may relocate a string body
+  that is only reachable through a marked array, so keeping `RSTRING_PTR` would
+  require pinning every parameter string in the mark function. One memcpy at
+  build time removes that whole class of bug.
+- **Text is exported to the connection encoding at seal time.** ruby-pg converts
+  string parameters before sending, so the sealed path must too. Sealing happens
+  before a request is routed to a driver, so there is no "the" connection to ask:
+  each successful connect publishes its negotiated `client_encoding`, and
+  requests seal against the most recent one (UTF-8 until the first connect).
+  A pool whose connections disagree on `client_encoding` is out of contract.
+- **Sealing cannot half-succeed.** Every Ruby call that can raise (`to_s`,
+  `NUM2UINT`, NUL checks) happens before the arena is allocated, so an invalid
+  parameter raises at `Request.build` with nothing to clean up.
+
+Because the arena is self-contained, failover is a memcpy: `Request#respawn`
+returns a *new* request object -- the invariant that a failed Request is never
+re-dispatched still holds -- that adopts a byte copy of the payload instead of
+re-encoding it.
+
 ## 4. Protocol/FIFO model
 
 Each multiplexed unit is encoded as:
@@ -73,7 +133,9 @@ been queued successfully.
 
 Results are associated with `@inflight.first`:
 
-- ordinary/error `PG::Result` -> belongs to the FIFO front;
+- an ordinary or error result (a raw `PGresult` since 0.4, wrapped as
+  `PgPipeline::Native::Result` only when it is handed to the waiter) -> belongs
+  to the FIFO front;
 - `nil` -> end of that query's results;
 - `PGRES_PIPELINE_SYNC` -> end of that logical unit; only here is FIFO front
   removed and its waiter resolved;
@@ -274,7 +336,7 @@ absence of maskable syntax justifies skipping stage 1.
 ## 10b. Fill observability
 
 Pipelining pays off only when one reactor wakeup is amortised over several units.
-`ConnectionDriver#stats` therefore reports `units_per_readable` (and related
+`NativeConnectionDriver#stats` therefore reports `units_per_readable` (and related
 counters) alongside the queue depths. A value near 1.0 means each query costs a
 full socket wait and a scheduler round trip, which bounds throughput
 independently of control-plane work; values well above 1.0 mean the pipeline is
@@ -284,19 +346,17 @@ filling. Read this number before attributing throughput to Ruby-side cost.
 
 | Component | Minimum | Reason |
 |---|---:|---|
-| Ruby | 3.3 | our dev-env floor; required by the current async line |
-| async | ~> 2.42 | Async-native; floor 2.42.0 is exercised separately in CI |
-| pg | >= 1.5, < 2 | pipeline bindings + raw result/flush + setnonblocking |
-| libpq | 14 | pipeline API introduced here (client-side) |
+| Ruby | 3.3 | our dev-env floor; matches mainstream Fiber scheduler hosts |
+| async | dev only ~> 2.42 | test/bench host; not a runtime dependency |
+| pg | >= 1.5, < 2 | pinned sessions and explicit transactions |
+| libpq (headers + runtime) | 14 | pipeline API; required to build and load the native extension |
 | server | protocol v3 | pipeline is client-side; NO server-14 requirement |
 
-We go Async-native and depend on the current async line rather than reinventing
-its coordination primitives to hold an older Ruby floor. Ruby/async are OUR
-dev-env floors — chosen freely for what maximally simplifies the implementation.
 libpq/server are the USER's floor and are NOT raised without cause: libpq 14 is
 the true minimum (no pipeline mode below it); the server only needs protocol v3.
-libpq 17 is an optional runtime-detected fast path (`PQsendPipelineSync`,
-chunked-rows, non-blocking cancel), never a floor.
+libpq 17 is an optional runtime-detected fast path (`PQsendPipelineSync`),
+never a floor. Building from source needs libpq development headers (Homebrew
+`libpq` is keg-only; set `PG_CONFIG` if needed).
 
 > The server floor is the user's environment; revisit annually against
 > PostgreSQL's EOL calendar. Capability gating is by `PG.library_version`
@@ -323,10 +383,9 @@ chunked-rows, non-blocking cancel), never a floor.
 - `SessionGuard` is policy/ergonomics, not a security boundary. `:strict` adds a
   precise denylist (`nextval`/`setval`/`pg_export_snapshot`, …) without the old
   broad `pg_*(` / `set*(` false positives; UDFs can still mutate session state.
-- Live integration covers **server** PG 14/16/17/18. A separate CI matrix
-  builds ruby-pg against source-built **client** libpq 14/16/17, asserts the
-  linked major, and runs both unit and live integration suites because pipeline
-  capability is determined by client libpq rather than server version.
+- Live integration covers **server** PG 14/16/17/18 against the runner's distro
+  **client** libpq. Pipeline Sync capability follows that client (fast Sync on
+  libpq ≥ 17 when the extension was compiled with `PQsendPipelineSync`).
 - On libpq 14–16, `place_sync` uses `PQpipelineSync` / ruby-pg `sync_pipeline_sync`
   (flush coupled); libpq 17+ uses `send_pipeline_sync` + explicit `sync_flush`.
 - Pinned recycle still runs full `DISCARD ALL` (no lighter reset profile / recycle
@@ -353,15 +412,29 @@ Implemented:
   live sibling; the failed Request object itself is never re-used.
 - `abort!` CancelRequest on in-use pinned connections.
 - Falcon per-worker contract + sizing formula; reactor-local Client fail-fast.
-- Packaging: gemspec metadata, CI (unit + PG server 14/16/17/18 + client-libpq
-  14/16/17 + exact async floor), docker-compose,
-  examples, `bench_kit/pipeline_throughput.rb` + `bench_kit/multiworker_smoke.rb`.
+- Packaging: gemspec metadata, CI (unit + PG server 14/16/17/18 + gem install +
+  hygiene), docker-compose, examples,
+  `bench_kit/pipeline_throughput.rb` + `bench_kit/multiworker_smoke.rb`.
 - Live integration suite (multiplex, isolation, cancel-drain, savepoints, stats,
   backpressure, pinned concurrency, indeterminate on abort, reconnect, backend
   terminate recovery, pinned abort cancel).
+
+Implemented in 0.4:
+
+- Native multiplexed data plane; sealed dispatch payloads with zero `rb_funcall`
+  on the send path.
+- Hot-path counters in the C driver struct; `Driver#stats` read on demand.
+- Failover by payload adoption rather than re-encoding.
+- Native-backend live specs on a dependency-free reference `Fiber::Scheduler`.
+- CI compiles the extension for the current tree against distro libpq,
+  builds/installs that gem, and exercises PostgreSQL server majors 14–18.
+- `bench:dispatch` for isolated send-path cost.
 
 Still open:
 
 - Lighter pinned reset / recycle-latency metrics under high-TPS tx.
 - Force socket close if pinned cancel is ignored.
 - Published bench numbers in README; tighten multiworker smoke to peak occupancy.
+- `SessionGuard`'s verdict cache is module-global and keyed by the full SQL
+  string; a per-client cache keyed by frozen-string identity would avoid
+  rehashing every statement on every call.

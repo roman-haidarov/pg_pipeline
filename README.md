@@ -23,10 +23,14 @@ fiber C → SEND query C ─┘               ├─ RECV A, B, C
 At 10 ms RTT a naïve pool does ~100 queries/s per connection.  
 A pipelined connection can do thousands — the wire stays full instead of sitting idle.
 
-`pg_pipeline` is the Ruby control plane that does exactly this: it multiplexes
+`pg_pipeline` is the fiber control plane that does exactly this: it multiplexes
 independent queries from many fibers onto a small pool of libpq connections,
 routes FIFO results back to the right fiber, and keeps transactional/session work
-on separate pinned connections. All wire protocol work stays in libpq; zero C code here.
+on separate pinned connections. Wire protocol work stays in libpq. Version 0.4
+runs the multiplexed data plane (request state, send/flush/drain, `PGresult`
+ownership) in a C extension while the owner/watcher tasks and pool stay on
+`PgPipeline::Runtime` + any `Fiber::Scheduler`. Pinned sessions and explicit
+transactions continue to use ruby-pg.
 
 The single-owner connection model, FIFO result ownership, and lifecycle approach
 are directly inspired by tokio-postgres.
@@ -91,7 +95,17 @@ request is spent outside the database.
 gem "pg_pipeline"
 ```
 
-Requires Ruby ≥ 3.3, `async ~> 2.42`, `pg ≥ 1.5`, and **libpq ≥ 14** at runtime.
+Requires Ruby ≥ 3.3, `pg ≥ 1.5`, and **libpq ≥ 14** at runtime. `async` is a
+development dependency: the gem needs *some* `Fiber::Scheduler` installed on the
+thread, and does not care which. Pick one yourself if your host does not provide
+one.
+
+There is no precompiled platform gem. `pg_pipeline` ships a C extension, so
+installing it builds from source and needs a C compiler and the libpq
+development headers (`libpq-dev` on Debian/Ubuntu, `libpq` from Homebrew on
+macOS, `postgresql-devel` on RHEL). Point `PG_CONFIG` at a specific `pg_config`
+if you have more than one libpq installed. Plan for this in image builds and in
+any environment that installs gems without a toolchain.
 
 **libpq ≥ 17 is recommended for maximum local throughput.** Below 17 there is no
 `PQsendPipelineSync`, so `PQpipelineSync` couples Sync with a flush and the driver
@@ -111,17 +125,41 @@ require "pg_pipeline"
 Sync do |task|
   PgPipeline::Client.open(ENV["DATABASE_URL"]) do |db|
     # 20 queries fly out in parallel over a handful of connections
-    results = (1..20).map do |id|
-      task.async { db.query("SELECT $1::int AS id, now() AS at", [id]) }
+    rows = (1..20).map do |id|
+      task.async do
+        result = db.query("SELECT $1::int AS id, now() AS at", [id])
+        begin
+          result.first
+        ensure
+          result.clear
+        end
+      end
     end.map(&:wait)
 
-    p results.first # => [{"id"=>"1", "at"=>"..."}]
+    p rows.first # => {"id"=>"1", "at"=>"..."}
   end
 end
 ```
 
 `Client.open` manages the pool lifecycle. `db.query` is fiber-safe and multiplexed —
 every fiber yields while waiting, the event loop stays unblocked.
+
+### Results are yours to clear
+
+`query` and `PreparedStatement#query` return a `PgPipeline::Result` that owns a
+libpq `PGresult` living outside the Ruby heap. The GC is told how big that is and
+will free it eventually, but "eventually" is the wrong schedule for a result set
+of any size: call `#clear` as soon as you have taken what you need, ideally in an
+`ensure`. `#clear` is idempotent, and reading a cleared result raises
+`ProtocolError` rather than returning stale rows.
+
+The row and metadata surface is the one you already know — `#first`, `#each`,
+`#each_row`, `#to_a`, `#values`, `#ntuples`/`#num_tuples`, `#nfields`/`#num_fields`,
+`#fields`, `#getvalue`, `#cmd_tuples`, `#error_message`, `#error_field`. Two
+things do **not** carry over from `PG::Result`, see the 0.4.0 CHANGELOG:
+`is_a?(PG::Result)` is false, and ruby-pg's type maps (`map_types!`,
+`PG::BasicTypeMapForResults`) are not available — the multiplexed path always
+requests text-format results, so values arrive as strings.
 
 ### Multiplexed prepared statements
 
@@ -238,6 +276,15 @@ reactor wakeup and one flush per six queries. `results_per_readable` runs at
 three times `units_per_readable` because a completed unit yields three protocol
 results -- the data, the query boundary and the Sync.
 
+**That 7.9 is not what you will see from `rake bench:throughput`.** A fiber storm
+against a local socket typically sits just above `1.0`: with no round-trip to
+wait through, each query is answered before the next one is submitted, so there
+is nothing to batch and the pipeline never fills. Both numbers are real; they
+measure different regimes. If you are evaluating this gem, the question is which
+regime your production traffic is in, and the answer is set by your RTT and your
+concurrency, not by the driver. Inject latency (`rake bench:proxy`) before
+concluding anything from a localhost throughput run.
+
 ## Head-of-line blocking
 
 Results on a pipelined connection arrive in FIFO order, and PostgreSQL offers no
@@ -258,6 +305,48 @@ If your workload mixes fast and slow queries, prefer one of:
 - a second `Client` with its own connections for the slow queries;
 - `Client#session` for anything long-running, which uses an exclusive pinned
   connection and cannot block multiplexed traffic.
+
+## What the session guard does and does not catch
+
+Multiplexed queries share a connection, so anything that mutates session state
+would leak between unrelated fibers. `SessionGuard` refuses those before they
+reach the wire. It is a **policy scanner over masked SQL, not a parser**, and the
+distinction matters when you decide how much to lean on it.
+
+It masks string literals, dollar-quoted bodies, `E''` escapes and both comment
+forms before scanning, so the checks cannot be fooled by hiding a keyword in a
+literal or by splitting a call across a comment. It then refuses:
+
+| Reason | Example |
+|---|---|
+| `leading:<kw>` | anything not starting `SELECT`/`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`VALUES`/`WITH` — so `SET`, `SHOW`, `DISCARD`, `PREPARE`, `DECLARE`, `COPY`, DDL |
+| `multiple-statements` | `SELECT 1; SET application_name = 'x'` |
+| `set_config`, `setseed`, `currval`, `lastval` | including `pg_catalog.set_config(…)` and `"set_config"(…)` |
+| `session-advisory-lock` / `-unlock` | the session-scoped `pg_advisory_*` family (transaction-scoped `pg_advisory_xact_*` is allowed — it releases at the unit's Sync) |
+| `dblink-session` | `dblink_connect` / `dblink_disconnect`: named connections outlive the unit |
+| `large-object` | `lo_open`/`lo_import`/`loread`/… : descriptors are session- and transaction-scoped |
+| `select-into-temp`, `select-into-pg-temp` | `SELECT … INTO TEMP t` |
+| `unicode-escaped-identifier`, `uescape` | `U&"pg_advisory_\006Cock"(1)` — the escaped form resolves to a name the scanner cannot see, so it is refused rather than guessed at |
+| `strict:nextval`, `strict:setval`, `strict:pg_export_snapshot` | `guard: :strict` only |
+
+What it **cannot** see, by construction:
+
+- **Side effects inside a function you call.** `SELECT my_report(1)` is
+  session-neutral as far as the scanner is concerned; if `my_report` does a `SET`
+  or takes an advisory lock internally, that lands on a shared connection. No
+  scanner can resolve this without the catalog.
+- **Sequence advances reached indirectly.** `INSERT INTO t(name) VALUES ($1)`
+  against a `serial` column advances the sequence and sets `currval` on whichever
+  connection ran it. The blast radius is contained — `currval` and `lastval` are
+  themselves refused on the multiplexed path, so no fiber can read the wrong one
+  — but use `RETURNING id` rather than reasoning about sequence state.
+- **Cost.** `SELECT pg_sleep(30)` is perfectly session-neutral and will block
+  everything queued behind it on that connection. See *Head-of-line blocking*.
+
+Treat the guard as a guard rail against a mistake in your own code, not as a
+security boundary: if an attacker controls the SQL string rather than the bind
+parameters, you have already lost. When you legitimately need session state, use
+`Client#session` — that is what the exclusive pinned connections are for.
 
 ## Failure model
 

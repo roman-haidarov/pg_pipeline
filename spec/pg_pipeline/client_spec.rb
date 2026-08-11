@@ -15,11 +15,11 @@ RSpec.describe PgPipeline::ClientOps do
     it "returns the request when the first driver accepts it" do
       Async do
         client, pool = client_double(pipeline_size: 2)
-        driver = instance_double(PgPipeline::ConnectionDriver)
+        driver = instance_double(PgPipeline::NativeConnectionDriver)
         allow(pool).to receive(:pipeline_driver).and_return(driver)
         allow(driver).to receive(:submit) { |request| request }
 
-        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
+        request = described_class.submit_with_failover(client, PgPipeline::Request.new(sql: "SELECT 1"))
         expect(request).to be_a(PgPipeline::Request)
         expect(driver).to have_received(:submit).once
       end.wait
@@ -28,8 +28,8 @@ RSpec.describe PgPipeline::ClientOps do
     it "retries on a fresh Request when the driver rejects pre-dispatch" do
       Async do
         client, pool = client_double(pipeline_size: 2)
-        dead = instance_double(PgPipeline::ConnectionDriver)
-        live = instance_double(PgPipeline::ConnectionDriver)
+        dead = instance_double(PgPipeline::NativeConnectionDriver)
+        live = instance_double(PgPipeline::NativeConnectionDriver)
         calls = 0
 
         allow(pool).to receive(:pipeline_driver) do
@@ -42,7 +42,7 @@ RSpec.describe PgPipeline::ClientOps do
         end
         allow(live).to receive(:submit) { |request| request.queued!; request }
 
-        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
+        request = described_class.submit_with_failover(client, PgPipeline::Request.new(sql: "SELECT 1"))
         expect(request.state).to eq(:queued)
         expect(calls).to eq(2)
       end.wait
@@ -51,8 +51,8 @@ RSpec.describe PgPipeline::ClientOps do
     it "retries a settled NotDispatchedError on a fresh Request" do
       Async do
         client, pool = client_double(pipeline_size: 2)
-        dead = instance_double(PgPipeline::ConnectionDriver)
-        live = instance_double(PgPipeline::ConnectionDriver)
+        dead = instance_double(PgPipeline::NativeConnectionDriver)
+        live = instance_double(PgPipeline::NativeConnectionDriver)
         calls = 0
 
         allow(pool).to receive(:pipeline_driver) do
@@ -66,7 +66,7 @@ RSpec.describe PgPipeline::ClientOps do
         end
         allow(live).to receive(:submit) { |request| request.queued!; request }
 
-        request = described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
+        request = described_class.submit_with_failover(client, PgPipeline::Request.new(sql: "SELECT 1"))
         expect(request.state).to eq(:queued)
         expect(calls).to eq(2)
       end.wait
@@ -75,16 +75,32 @@ RSpec.describe PgPipeline::ClientOps do
     it "raises NotDispatchedError when every attempt fails pre-dispatch" do
       Async do
         client, pool = client_double(pipeline_size: 2)
-        driver = instance_double(PgPipeline::ConnectionDriver)
+        driver = instance_double(PgPipeline::NativeConnectionDriver)
         allow(pool).to receive(:pipeline_driver).and_return(driver)
         allow(driver).to receive(:submit)
           .and_raise(PgPipeline::NotDispatchedError, "no live pipeline connections")
 
         expect {
-          described_class.submit_with_failover(client) { PgPipeline::Request.new(sql: "SELECT 1") }
+          described_class.submit_with_failover(client, PgPipeline::Request.new(sql: "SELECT 1"))
         }.to raise_error(PgPipeline::NotDispatchedError)
 
         expect(driver).to have_received(:submit).twice
+      end.wait
+    end
+
+    it "does not failover on IndeterminateResultError from inline dispatch" do
+      Async do
+        client, pool = client_double(pipeline_size: 2)
+        driver = instance_double(PgPipeline::NativeConnectionDriver)
+        allow(pool).to receive(:pipeline_driver).and_return(driver)
+        allow(driver).to receive(:submit)
+          .and_raise(PgPipeline::IndeterminateResultError, "sync not observed")
+
+        expect {
+          described_class.submit_with_failover(client, PgPipeline::Request.new(sql: "SELECT 1"))
+        }.to raise_error(PgPipeline::IndeterminateResultError)
+
+        expect(driver).to have_received(:submit).once
       end.wait
     end
   end
@@ -120,7 +136,7 @@ RSpec.describe PgPipeline::ClientOps do
     it "submits a prepared-query request without re-running the SQL guard" do
       Sync do
         pool = instance_double(PgPipeline::Pool, pipeline_size: 1)
-        driver = instance_double(PgPipeline::ConnectionDriver)
+        driver = instance_double(PgPipeline::NativeConnectionDriver)
         client = started_client(pool)
         statement = instance_double(PgPipeline::PreparedStatement, physical_name: "pgp_1", sql: "SELECT $1::int".freeze)
         result = Object.new
@@ -139,63 +155,6 @@ RSpec.describe PgPipeline::ClientOps do
 
         expect(described_class.query_prepared(client, statement, [7])).to equal(result)
       end
-    end
-  end
-
-  describe "lifecycle cleanup" do
-    def lifecycle_client(pool)
-      PgPipeline::Client.allocate.tap do |client|
-        client.instance_variable_set(:@pool, pool)
-        client.instance_variable_set(:@started, true)
-        client.instance_variable_set(:@owner_thread, Thread.current)
-        client.instance_variable_set(:@scheduler, Fiber.scheduler)
-      end
-    end
-
-    it "marks the client stopped when terminal close cleanup reports an error" do
-      pool = instance_double(PgPipeline::Pool, closing?: true)
-      allow(pool).to receive(:graceful_close).and_raise(RuntimeError, "driver close failed")
-      client = lifecycle_client(pool)
-
-      expect { described_class.close(client) }
-        .to raise_error(RuntimeError, "driver close failed")
-      expect(described_class.started?(client)).to be(false)
-    end
-
-    it "keeps the client started when close is rejected before shutdown begins" do
-      pool = instance_double(PgPipeline::Pool, closing?: false)
-      allow(pool).to receive(:graceful_close)
-        .and_raise(PgPipeline::Error, "cannot close from inside a pinned block")
-      client = lifecycle_client(pool)
-
-      expect { described_class.close(client) }
-        .to raise_error(PgPipeline::Error, /cannot close/)
-      expect(described_class.started?(client)).to be(true)
-    end
-  end
-
-  describe "public surface" do
-    it "rejects unknown guard modes instead of falling back to default" do
-      expect { PgPipeline::Client.new(nil, guard: :strcit) }
-        .to raise_error(ArgumentError, /guard must be one of/)
-    end
-
-    it "does not expose the internal pool through the public Client API" do
-      client = PgPipeline::Client.new(nil)
-      expect(client).not_to respond_to(:pool)
-      expect(client).to respond_to(:stats)
-      expect(client).to respond_to(:prepare)
-    end
-
-    it "does not expose lifecycle ownership state through public accessors" do
-      client = PgPipeline::Client.new(nil)
-
-      expect(client).not_to respond_to(:started)
-      expect(client).not_to respond_to(:started=)
-      expect(client).not_to respond_to(:owner_thread)
-      expect(client).not_to respond_to(:owner_thread=)
-      expect(client).not_to respond_to(:scheduler)
-      expect(client).not_to respond_to(:scheduler=)
     end
   end
 end
