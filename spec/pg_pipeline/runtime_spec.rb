@@ -83,25 +83,18 @@ end
 
 RSpec.describe PgPipeline::Runtime do
   describe ".with_timeout" do
-    it "uses Timeout.timeout rather than calling scheduler.timeout_after directly" do
+    it "calls timeout_after with duration, Deadline, and message when the hook exists" do
       Async do
         scheduler = Fiber.scheduler
-        calls = []
-        if scheduler.respond_to?(:timeout_after)
-          original = scheduler.method(:timeout_after)
-          allow(scheduler).to receive(:timeout_after) do |*args, &block|
-            calls << args
-            original.call(*args, &block)
-          end
-        end
+        next unless scheduler.respond_to?(:timeout_after)
+
+        expect(scheduler).to receive(:timeout_after).with(
+          1.0,
+          PgPipeline::Runtime::Deadline,
+          PgPipeline::Runtime::DEADLINE_MESSAGE
+        ).and_call_original
 
         expect(described_class.with_timeout(1.0) { :ok }).to eq(:ok)
-
-        # Timeout.timeout may invoke the hook with the full arity; we must never
-        # call it ourselves with a single duration argument.
-        calls.each do |args|
-          expect(args.length).to be >= 2
-        end
       end.wait
     end
 
@@ -110,6 +103,26 @@ RSpec.describe PgPipeline::Runtime do
         expect {
           described_class.with_timeout(0.01) { sleep 1 }
         }.to raise_error(PgPipeline::Runtime::TimeoutError)
+      end.wait
+    end
+
+    it "uses a Deadline that rescue => e cannot swallow" do
+      expect(PgPipeline::Runtime::Deadline < Exception).to be(true)
+      expect(PgPipeline::Runtime::Deadline.ancestors).not_to include(StandardError)
+    end
+
+    it "does not let an inner bounded wait swallow an enclosing deadline" do
+      Async do
+        expect {
+          described_class.with_timeout(0.05) { PgPipeline::Runtime::Notification.new.wait(10) }
+        }.to raise_error(PgPipeline::Runtime::TimeoutError)
+      end.wait
+    end
+
+    it "does not let an enclosing deadline leak out of an inner bounded wait" do
+      Async do
+        expect(described_class.with_timeout(5) { PgPipeline::Runtime::Notification.new.wait(0.05) })
+          .to be(false)
       end.wait
     end
 
@@ -123,16 +136,18 @@ RSpec.describe PgPipeline::Runtime do
         fiber
       end
       def fake.kernel_sleep(duration)
-        # no-op immediate wake for tests that only exercise Timeout path
         duration
       end
       def fake.io_wait(*) = true
 
+      described_class.instance_variable_set(:@warned_schedulers, {})
+
       previous = Fiber.scheduler
       Fiber.set_scheduler(fake)
       begin
-        # Fiber.schedule needs scheduler#fiber on some Rubies; use Timeout path only.
-        expect(described_class.with_timeout(0.05) { :ok }).to eq(:ok)
+        expect {
+          expect(described_class.with_timeout(0.05) { :ok }).to eq(:ok)
+        }.to output(/does not implement #timeout_after/).to_stderr
       ensure
         Fiber.set_scheduler(previous)
       end
@@ -163,6 +178,39 @@ RSpec.describe PgPipeline::Runtime do
       Async do
         notification = described_class.new
         expect(notification.wait(0.01)).to be(false)
+      end.wait
+    end
+
+    it "treats a zero timeout as a poll rather than parking" do
+      Async do
+        notification = described_class.new
+        expect(notification.wait(0)).to be(false)
+      end.wait
+    end
+
+    it "does not need the timeout_after hook: timed wait uses scheduler#block" do
+      Async do
+        scheduler = Fiber.scheduler
+        expect(scheduler).not_to receive(:timeout_after) if scheduler.respond_to?(:timeout_after)
+        expect(described_class.new.wait(0.01)).to be(false)
+      end.wait
+    end
+
+    it "skips a waiter that Task#stop already released" do
+      Async do
+        notification = described_class.new
+        woken = []
+
+        stopped = PgPipeline::Runtime.spawn { notification.wait; woken << :stopped }
+        live = PgPipeline::Runtime.spawn { notification.wait; woken << :live }
+        sleep 0.01 until notification.waiting == 2
+
+        expect(stopped.stop).to be(true)
+        expect(notification.signal).to be(true)
+        live.wait
+
+        expect(woken).to eq([:live])
+        expect(stopped).to be_finished
       end.wait
     end
   end

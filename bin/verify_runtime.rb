@@ -12,30 +12,77 @@ class StubScheduler
   def initialize
     @ready = []
     @hook_calls = []
+    @timeouts = []
+    @blocked = []
   end
+
+  def monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
   def fiber(&block)
-    f = Fiber.new(blocking: false, &block)
-    f.resume
-    f
+    fiber = Fiber.new(blocking: false, &block)
+    fiber.resume
+    fiber
   end
 
-  def block(_blocker, _timeout) = Fiber.yield
-  def unblock(_blocker, fiber) = (@ready << fiber)
+  def block(_blocker, timeout = nil)
+    @blocked << [monotonic + timeout, Fiber.current] if timeout
+    Fiber.yield
+  end
+
+  def unblock(_blocker, fiber)
+    @blocked.reject! { |(_, blocked)| blocked == fiber }
+    @ready << fiber
+  end
+
   def kernel_sleep(_duration = nil) = nil
   def io_wait(_io, _events, _timeout) = nil
   def close = drain
 
   def drain
-    until @ready.empty?
-      fiber = @ready.shift
-      fiber.resume if fiber&.alive?
+    loop do
+      until @ready.empty?
+        fiber = @ready.shift
+        next if fiber.nil? || fiber.equal?(Fiber.current)
+
+        fiber.resume if fiber.alive?
+      end
+
+      next_block = @blocked.min_by(&:first)
+      next_timeout = @timeouts.min_by(&:first)
+      break if next_block.nil? && next_timeout.nil?
+
+      if next_timeout && (next_block.nil? || next_timeout.first <= next_block.first)
+        expire_timeout(next_timeout)
+      else
+        resume_blocked(next_block)
+      end
     end
+  end
+
+  def resume_blocked(entry)
+    @blocked.delete(entry)
+    fiber = entry[1]
+    @ready << fiber if fiber.alive?
+  end
+
+  def expire_timeout(entry)
+    @timeouts.delete(entry)
+    _, fiber, klass, message = entry
+    return unless fiber.alive?
+
+    @ready.delete(fiber)
+    fiber.raise(klass, message)
   end
 
   def timeout_after(duration, exception, message, &block)
     @hook_calls << [duration, exception, message]
-    yield(duration)
+    entry = [monotonic + duration, Fiber.current, exception, message]
+    @timeouts << entry
+    begin
+      yield(duration)
+    ensure
+      @timeouts.delete(entry)
+    end
   end
 end
 
@@ -57,7 +104,8 @@ end
 def with_scheduler(scheduler)
   Thread.new do
     Fiber.set_scheduler(scheduler)
-    yield
+    Fiber.schedule { yield }
+    scheduler.drain
   end.join
 end
 
@@ -65,12 +113,24 @@ end
   puts "\n#{klass} (timeout_after hook: #{klass.instance_methods.include?(:timeout_after)})"
 
   with_scheduler(klass.new) do
-    check "with_timeout does not call the timeout_after hook directly" do
-      PgPipeline::Runtime.with_timeout(0.5) { :ok } == :ok
+    check "with_timeout uses the scheduler hook when the scheduler has one" do
+      scheduler = Fiber.scheduler
+      if scheduler.respond_to?(:timeout_after)
+        before = scheduler.hook_calls.size
+        PgPipeline::Runtime.with_timeout(5) { :done }
+        last = scheduler.hook_calls.last
+        scheduler.hook_calls.size > before && last.length >= 3 && last[1] == PgPipeline::Runtime::Deadline
+      else
+        PgPipeline::Runtime.with_timeout(5) { :done } == :done
+      end
     end
 
     check "with_timeout passes nil through untouched" do
       PgPipeline::Runtime.with_timeout(nil) { :ok } == :ok
+    end
+
+    check "Deadline is not a StandardError" do
+      PgPipeline::Runtime::Deadline < Exception && !(PgPipeline::Runtime::Deadline < StandardError)
     end
 
     check "Notification#wait blocks until THIS waiter is signalled" do
@@ -81,6 +141,14 @@ end
       n.signal
       Fiber.scheduler.drain
       order == %i[before woke]
+    end
+
+    check "Notification#wait(timeout) returns false without the timeout_after hook" do
+      PgPipeline::Runtime::Notification.new.wait(0.01) == false
+    end
+
+    check "Notification#wait(0) polls instead of parking" do
+      PgPipeline::Runtime::Notification.new.wait(0) == false
     end
 
     check "Queue#enqueue on a closed queue is a no-op, not an exception" do
@@ -138,6 +206,18 @@ end
       end
     end
 
+    check "Task#wait(timeout) raises TimeoutError" do
+      parked = PgPipeline::Runtime::Notification.new
+      task = PgPipeline::Runtime::Task.spawn { parked.wait }
+      begin
+        task.wait(0.01)
+        false
+      rescue PgPipeline::Runtime::TimeoutError
+        parked.signal
+        true
+      end
+    end
+
     check "cooperative stop unwinds a parked task without Fiber#raise" do
       gate = PgPipeline::Runtime::Notification.new
       t = PgPipeline::Runtime::Task.spawn(name: :parked) { gate.wait }
@@ -185,28 +265,39 @@ end
       t.finished? && n.signal == false
     end
 
-    check "the gem calls ONLY block/unblock on the scheduler" do
-      allowed = %w[block unblock equal? nil? respond_to?]
+    check "signal skips a waiter already released by Task#stop" do
+      notification = PgPipeline::Runtime::Notification.new
+      woken = []
+      stopped = PgPipeline::Runtime::Task.spawn { notification.wait; woken << :stopped }
+      PgPipeline::Runtime::Task.spawn { notification.wait; woken << :live }
+      stopped.stop
+      notification.signal
+      Fiber.scheduler.drain
+      woken == [:live]
+    end
+
+    check "the gem only uses Fiber::Scheduler hooks block/unblock/fiber_interrupt/timeout_after" do
+      allowed = %w[block unblock fiber_interrupt timeout_after respond_to? equal? nil?]
       root = File.expand_path("../lib", __dir__)
       offenders = Dir[File.join(root, "**/*.rb")].flat_map do |path|
         File.readlines(path).each_with_index.filter_map do |line, i|
           next if line =~ /^\s*#/
           name = line[/(?:Fiber\.scheduler|@?scheduler)\.(\w+\??)/, 1]
           next if name.nil? || allowed.include?(name)
-          "#{path.sub(root + '/', '')}:#{i + 1} -> #{name}"
+          "#{path.sub("#{root}/", "")}:#{i + 1} -> #{name}"
         end
       end
       offenders.each { |o| puts "        #{o}" }
       offenders.empty?
     end
 
-    check "Fiber#raise never reaches a fiber parked by Runtime.park" do
+    check "Task#stop uses fiber_interrupt, not Fiber#raise, to interrupt work" do
       source = File.read(File.expand_path("../lib/pg_pipeline/runtime/task.rb", __dir__))
       body = source[/def interrupt_fiber.*?\n      end/m].to_s
-      body.include?("return false if @blocker") && body.include?("fiber.raise")
+      body.include?("fiber_interrupt") && !body.include?("fiber.raise")
     end
 
-    check "bounded waits never invoke the timeout_after hook with bad arity" do
+    check "bounded waits never invoke the timeout_after hook" do
       scheduler = Fiber.scheduler
       scheduler.hook_calls.clear if scheduler.respond_to?(:hook_calls)
 
@@ -215,11 +306,25 @@ end
       done.wait(1.0)
 
       n = PgPipeline::Runtime::Notification.new
-      PgPipeline::Runtime::Task.spawn { n.signal }
-      Fiber.scheduler.drain
+      n.wait(0)
 
       calls = scheduler.respond_to?(:hook_calls) ? scheduler.hook_calls : []
-      calls.all? { |args| args.length >= 2 }
+      calls.empty?
+    end
+
+    if Fiber.scheduler.respond_to?(:timeout_after)
+      check "a bounded inner wait does not swallow an enclosing deadline" do
+        begin
+          PgPipeline::Runtime.with_timeout(0.05) { PgPipeline::Runtime::Notification.new.wait(10) }
+          false
+        rescue PgPipeline::Runtime::TimeoutError
+          true
+        end
+      end
+
+      check "an enclosing deadline does not leak out of a bounded inner wait" do
+        PgPipeline::Runtime.with_timeout(5) { PgPipeline::Runtime::Notification.new.wait(0.01) } == false
+      end
     end
   end
 end

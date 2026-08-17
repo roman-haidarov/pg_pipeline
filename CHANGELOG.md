@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.2] - 2026-08-17
+
+Runtime correctness. Public SQL, Sync-per-unit, failure model, and the
+`Fiber::Scheduler` host contract are unchanged.
+
+### Fixed
+
+- Bounded waits (`Notification#wait`, `Task#wait`) park through
+  `scheduler.block(blocker, remaining)` and a monotonic deadline. They no
+  longer wrap `park` in `Timeout.timeout`. A wait timeout is not a work
+  timeout: `Notification#wait` no longer rescues `TimeoutError`, so an
+  enclosing `Runtime.with_timeout` cannot be swallowed by
+  `BoundedQueue#wait_on` or `wait_for_pinned_idle`. `wait(0)` polls.
+- `Runtime.with_timeout` (health probes and other work limits) calls
+  `scheduler.timeout_after(duration, Deadline, message)` when the hook
+  exists. `Deadline < Exception`, so `rescue => e` cannot eat it; the
+  method still raises `Runtime::TimeoutError` at its own boundary. A
+  scheduler without the hook falls back to stdlib `Timeout` and warns
+  once — `Thread#raise` can hit the wrong fiber.
+- `Notification#signal` and `Semaphore#release` skip a waiter that
+  `Task#stop` already released, or a fiber that is no longer alive. On a
+  deferred `unblock` the previous `shift` + wake handed the signal to the
+  stopped waiter and left the live one parked; a dead semaphore waiter
+  burned a pinned-pool slot. `park` also raises `Cancel` after a stop-wake
+  so the wait is not mistaken for a successful signal.
+
+### Unchanged
+
+- Per-fiber waiter-hash reuse, `Request` one-shot completion, watcher
+  `fiber_interrupt` / poll shutdown, and the host-installed scheduler
+  rule.
+
 ## [0.3.1] - 2026-08-09
 
 Reliability and correctness fixes on top of 0.3.0. No public API changes other

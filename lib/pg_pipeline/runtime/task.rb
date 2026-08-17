@@ -22,7 +22,10 @@ module PgPipeline
       end
 
       def wait(timeout = nil)
-        Runtime.with_timeout(timeout) { join }
+        unless @done
+          deadline = Runtime.deadline_for(timeout)
+          raise TimeoutError, "task did not finish in time" unless join(deadline)
+        end
         raise @error if @error
 
         @result
@@ -94,8 +97,8 @@ module PgPipeline
 
       def release_blocker
         waiter = @blocker or return false
-        Runtime.wake(waiter, waiter[:blocker])
-        waiter[:fiber].alive?
+
+        Runtime.wake(waiter, waiter[:blocker]) && waiter[:fiber].alive?
       end
 
       def complete(result, error)
@@ -107,11 +110,11 @@ module PgPipeline
         wake_waiters
       end
 
-      def join
-        return if @done
+      def join(deadline)
+        return true if @done
 
         Runtime.with_waiter(self, @waiters) do |waiter|
-          Runtime.park(self, waiter) { @done }
+          Runtime.park(self, waiter, deadline) { @done }
         end
       end
 

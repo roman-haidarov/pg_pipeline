@@ -7,19 +7,24 @@ module PgPipeline
         @waiters = []
       end
 
+      def waiting = @waiters.size
+
       def wait(timeout = nil)
+        wait_until(Runtime.deadline_for(timeout))
+      end
+
+      def wait_until(deadline = nil)
         Runtime.with_waiter(self, @waiters) do |waiter|
-          Runtime.with_timeout(timeout) { Runtime.park(self, waiter) { false } }
-          true
-        rescue TimeoutError
-          false
+          Runtime.park(self, waiter, deadline) { false }
         end
       end
 
       def signal
-        waiter = @waiters.shift or return false
-        Runtime.wake_dequeued(waiter, self)
-        true
+        while (waiter = @waiters.shift)
+          return true if Runtime.wake_dequeued(waiter, self)
+        end
+
+        false
       end
 
       def signal_all

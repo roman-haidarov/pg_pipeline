@@ -23,12 +23,12 @@ module PgPipeline
       end
 
       def release
-        if (node = @waiting.shift)
+        while (node = @waiting.shift)
           node.grant!
-          node.resume
-        else
-          @available += 1
+          return @available if node.resume
         end
+
+        @available += 1
         @available
       end
 
@@ -126,9 +126,10 @@ module PgPipeline
 
         def resume
           fiber = @fiber
-          return unless fiber.alive?
+          return false unless fiber.alive?
 
           @scheduler.unblock(@blocker, fiber)
+          true
         end
       end
 
