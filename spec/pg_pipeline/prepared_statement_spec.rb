@@ -17,12 +17,27 @@ RSpec.describe PgPipeline::PreparedStatement do
     expect(statement.name).to eq("user_by_id")
     expect(statement.sql).to be_frozen
     expect(statement.param_types).to eq([23])
+    expect(statement.typed?).to be(false)
 
     expect(PgPipeline::ClientOps).to receive(:query_prepared)
       .with(client, statement, [7])
       .and_return(:result)
 
     expect(statement.query([7])).to eq(:result)
+  end
+
+  it "records typed: true on the frozen handle" do
+    statement = described_class.new(
+      client: Object.new,
+      name: "typed_n",
+      physical_name: "pgp_2",
+      sql: "SELECT $1::int",
+      typed: true
+    )
+
+    expect(statement).to be_frozen
+    expect(statement.typed?).to be(true)
+    expect(statement.inspect).to include("typed")
   end
 
   it "rejects empty names and invalid parameter OIDs" do

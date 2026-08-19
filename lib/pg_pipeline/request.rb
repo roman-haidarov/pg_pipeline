@@ -6,7 +6,7 @@ module PgPipeline
   class Request
     attr_reader :sql, :params
     attr_accessor :state, :cancelled, :settled, :result_seen, :query_boundary_seen,
-                  :result, :error, :waiter, :waiter_scheduler
+                  :result, :error, :waiter, :waiter_scheduler, :type_map
 
     def initialize(sql:, params: nil)
       @sql = RequestOps.snapshot_sql(sql)
@@ -20,6 +20,7 @@ module PgPipeline
       @error = nil
       @waiter = nil
       @waiter_scheduler = nil
+      @type_map = nil
     end
 
     def self.build(sql, params)
@@ -64,6 +65,7 @@ module PgPipeline
       @error = nil
       @waiter = nil
       @waiter_scheduler = nil
+      @type_map = nil
       self
     end
   end

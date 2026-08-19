@@ -143,6 +143,27 @@ ensure
 end
 ```
 
+Pass `typed: true` to decode cells through ruby-pg's text type map (`Integer`,
+`Time`, `BigDecimal`, …) instead of strings. The map is built from the first
+result and reused. This does not change the wire format or the Sync-per-unit
+model; it is opt-in convenience, not a faster path.
+
+```ruby
+by_id = db.prepare(
+  "user_by_id",
+  "SELECT id, email FROM users WHERE id = $1",
+  [23],
+  typed: true
+)
+
+result = by_id.query([42])
+begin
+  result.first["id"] # => 42 (Integer)
+ensure
+  result.clear
+end
+```
+
 `Client#prepare` returns only after the statement is ready on every currently
 live pipeline connection. Replacement connections automatically prepare the
 registered catalog before they begin accepting requests. The logical name is

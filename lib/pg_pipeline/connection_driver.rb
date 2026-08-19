@@ -13,7 +13,7 @@ module PgPipeline
     DEFAULT_MAX_PENDING = 256
     DEFAULT_MAX_IN_FLIGHT = 64
 
-    attr_reader :conn, :caps, :max_pending, :max_in_flight
+    attr_reader :conn, :caps, :max_pending, :max_in_flight, :type_maps
     attr_accessor :socket, :requests, :events, :reader_rearm, :writer_commands,
                   :inflight, :dispatching, :submitting, :accepting, :running,
                   :draining, :needs_flush, :writer_armed, :request_event_pending,
@@ -30,11 +30,13 @@ module PgPipeline
     def dispatches = @dispatches || 0
     def leaked_watchers = @leaked_watchers || 0
 
-    def initialize(conn, max_pending: DEFAULT_MAX_PENDING, max_in_flight: DEFAULT_MAX_IN_FLIGHT)
+    def initialize(conn, max_pending: DEFAULT_MAX_PENDING, max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+                   type_maps: nil)
       @max_pending = DriverOps.positive_integer!(max_pending, :max_pending)
       @max_in_flight = DriverOps.positive_integer!(max_in_flight, :max_in_flight)
 
       @conn = conn
+      @type_maps = type_maps
       @caps = ServerCaps.from_connection(conn)
       @caps.assert_supported!
       DriverOps.warn_flush_coupling_once(@caps)
@@ -387,43 +389,59 @@ module PgPipeline
           request = d.inflight.first
           raise ProtocolError, "result without an in-flight request" unless request
 
-          if result.nil?
-            request.query_boundary!
-            next
-          end
-
-          status = result.result_status
-          case status
-          when PG::PGRES_TUPLES_OK
-            ensure_before_query_boundary!(request, status)
-            request.accept_result(result)
-          when PG::PGRES_PIPELINE_SYNC
-            clear_result(result)
-            complete_front(d, request)
-          when PG::PGRES_COMMAND_OK, PG::PGRES_EMPTY_QUERY
-            ensure_before_query_boundary!(request, status)
-            request.accept_result(result)
-          when PG::PGRES_FATAL_ERROR
-            ensure_before_query_boundary!(request, status)
-            request.record_error!(query_error(result), result: result)
-          when PG::PGRES_PIPELINE_ABORTED
-            ensure_before_query_boundary!(request, status)
-            clear_result(result)
-            request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
-          when PG::PGRES_BAD_RESPONSE
-            clear_result(result)
-            raise ProtocolError, "server response was not understood"
-          when PG::PGRES_COPY_IN, PG::PGRES_COPY_OUT, PG::PGRES_COPY_BOTH
-            clear_result(result)
-            raise ProtocolError, "COPY is not supported on the multiplexed pipeline"
-          else
-            clear_result(result)
-            raise ProtocolError, "unexpected pipeline result status #{status}"
-          end
+          handle_pipeline_result(d, request, result)
         end
       ensure
         d.results_read += read if read.positive?
       end
+    end
+
+    def handle_pipeline_result(d, request, result)
+      if result.nil?
+        request.query_boundary!
+        return
+      end
+
+      status = result.result_status
+      case status
+      when PG::PGRES_TUPLES_OK
+        accept_tuples_ok(d, request, result)
+      when PG::PGRES_PIPELINE_SYNC
+        clear_result(result)
+        complete_front(d, request)
+      when PG::PGRES_COMMAND_OK, PG::PGRES_EMPTY_QUERY
+        ensure_before_query_boundary!(request, status)
+        request.accept_result(result)
+      when PG::PGRES_FATAL_ERROR
+        ensure_before_query_boundary!(request, status)
+        request.record_error!(query_error(result), result: result)
+      when PG::PGRES_PIPELINE_ABORTED
+        ensure_before_query_boundary!(request, status)
+        clear_result(result)
+        request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
+      when PG::PGRES_BAD_RESPONSE
+        reject_pipeline_status!(result, "server response was not understood")
+      when PG::PGRES_COPY_IN, PG::PGRES_COPY_OUT, PG::PGRES_COPY_BOTH
+        reject_pipeline_status!(result, "COPY is not supported on the multiplexed pipeline")
+      else
+        reject_pipeline_status!(result, "unexpected pipeline result status #{status}")
+      end
+    end
+
+    def accept_tuples_ok(d, request, result)
+      ensure_before_query_boundary!(request, PG::PGRES_TUPLES_OK)
+      begin
+        apply_type_map(d, request, result)
+        request.accept_result(result)
+      rescue StandardError => e
+        message = e.is_a?(Error) ? e.message : "typed result mapping failed: #{e.class}: #{e.message}"
+        request.record_error!(QueryError.new(message, cause_result: result), result: result)
+      end
+    end
+
+    def reject_pipeline_status!(result, message)
+      clear_result(result)
+      raise ProtocolError, message
     end
 
     def ensure_before_query_boundary!(request, status)
@@ -642,6 +660,15 @@ module PgPipeline
       d.conn.close unless d.conn.finished?
     rescue StandardError
       nil
+    end
+
+    def apply_type_map(d, request, result)
+      return unless request.type_map
+
+      maps = d.type_maps
+      raise Error, "typed statement has no type-map registry" unless maps
+
+      maps.apply!(request, result, d.conn)
     end
 
     def clear_result(result)
