@@ -5,22 +5,26 @@ require_relative "request"
 
 module PgPipeline
   class PreparedStatement
-    attr_reader :name, :sql, :param_types, :physical_name
+    attr_reader :name, :sql, :param_types, :physical_name, :typed
 
-    def initialize(client:, name:, physical_name:, sql:, param_types: nil)
+    def initialize(client:, name:, physical_name:, sql:, param_types: nil, typed: false)
       @client = client
       @name = PreparedStatementOps.snapshot_name(name)
       @physical_name = PreparedStatementOps.snapshot_name(physical_name)
       @sql = RequestOps.snapshot_sql(sql)
       @param_types = RequestOps.snapshot_param_types(param_types)
+      @typed = !!typed
       freeze
     end
+
+    def typed? = @typed
 
     def query(params = RequestOps::EMPTY_PARAMS) = PreparedStatementOps.query(self, params)
     alias call query
 
     def inspect
-      "#<#{self.class} name=#{@name.inspect} sql=#{@sql.inspect}>"
+      flag = @typed ? " typed" : ""
+      "#<#{self.class} name=#{@name.inspect} sql=#{@sql.inspect}#{flag}>"
     end
 
     private
@@ -42,6 +46,5 @@ module PgPipeline
 
       value.frozen? ? value : value.dup.freeze
     end
-
   end
 end

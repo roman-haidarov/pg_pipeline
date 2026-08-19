@@ -263,6 +263,55 @@ RSpec.describe "pg_pipeline live", :integration do
     end
   end
 
+  it "decodes prepared results as Ruby types when typed: true" do
+    with_client(pipeline_size: 2, pinned_size: 0) do |db, task|
+      statement = db.prepare(
+        "typed_int",
+        "SELECT $1::int AS n, true AS b, TIMESTAMPTZ '2020-01-02 03:04:05+00' AS ts",
+        typed: true
+      )
+      plain = db.prepare("plain_int", "SELECT $1::int AS n")
+
+      typed_values = (1..50).map do |n|
+        task.async do
+          result = statement.query([n])
+          begin
+            row = result.first
+            [row["n"], row["b"], row["ts"]]
+          ensure
+            result.clear
+          end
+        end
+      end.map(&:wait)
+
+      expect(typed_values.map { |n, _, _| n }).to eq((1..50).to_a)
+      typed_values.each do |n, bool, ts|
+        expect(n).to be_a(Integer)
+        expect(bool).to equal(true)
+        expect(ts).to be_a(Time)
+      end
+
+      plain_result = plain.query([7])
+      begin
+        expect(plain_result.first["n"]).to eq("7")
+      ensure
+        plain_result.clear
+      end
+    end
+  end
+
+  it "surfaces a type-map failure as a request-local QueryError" do
+    with_client(pipeline_size: 1, pinned_size: 0) do |db, _task|
+      statement = db.prepare("typed_boom", "SELECT $1::int AS n", typed: true)
+      maps = db.__send__(:pool).instance_variable_get(:@type_maps)
+      maps.instance_variable_set(:@bundle, :failed)
+      maps.instance_variable_set(:@text_map_for_results, nil)
+
+      expect { statement.query([1]) }
+        .to raise_error(PgPipeline::QueryError, /unavailable|typed result mapping/)
+    end
+  end
+
   it "rejects non-session-neutral SQL on the multiplexed path" do
     with_client(pipeline_size: 1, pinned_size: 1) do |db, _task|
       expect { db.query("SET application_name = 'x'") }

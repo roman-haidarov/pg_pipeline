@@ -6,6 +6,7 @@ require_relative "errors"
 require_relative "runtime"
 require_relative "connection_driver"
 require_relative "prepared_statement"
+require_relative "type_maps"
 require_relative "server_caps"
 
 module PgPipeline
@@ -64,6 +65,7 @@ module PgPipeline
       @prepared_statements = {}
       @prepared_generation = 0
       @statement_sequence = 0
+      @type_maps = TypeMaps.new
 
       @pinned_free = []
       @pinned_in_use = {}
@@ -113,59 +115,90 @@ module PgPipeline
       driver
     end
 
-    def prepare_statement(client, name, sql, param_types)
+    def bind_type_map(request, statement)
+      return unless statement.typed?
+
+      maps = @type_maps
+      return unless maps
+
+      maps.bind(request, statement)
+    end
+
+    def prepare_statement(client, name, sql, param_types, typed: false)
       ensure_available!
       logical_name = PreparedStatementOps.snapshot_name(name)
       if @prepared_statements.key?(logical_name)
         raise Error, "prepared statement #{logical_name.inspect} already exists"
       end
 
+      statement = register_prepared_statement(client, logical_name, sql, param_types, typed)
+      requests = []
+
+      begin
+        requests = dispatch_prepare(statement)
+        await_prepares!(requests)
+        statement
+      rescue Exception
+        drop_prepared_statement(logical_name, statement)
+        raise
+      ensure
+        requests.each { |request| request.cancel! unless request.settled? }
+      end
+    end
+
+    def register_prepared_statement(client, logical_name, sql, param_types, typed)
       @statement_sequence += 1
       statement = PreparedStatement.new(
         client: client,
         name: logical_name,
         physical_name: "pgp_#{@statement_sequence.to_s(36)}",
         sql: sql,
-        param_types: param_types
+        param_types: param_types,
+        typed: typed
       )
 
       @prepared_statements[logical_name] = statement
+      register_typed_maps(statement) if statement.typed?
       @prepared_generation += 1
-      requests = []
+      statement
+    end
 
-      begin
-        drivers = @drivers.select(&:available?)
-        if drivers.empty?
-          raise NotDispatchedError, "no live pipeline connections; statement was not prepared"
-        end
+    def register_typed_maps(statement)
+      @type_maps ||= TypeMaps.new
+      @type_maps.register(statement)
+      @type_maps.ensure_bundle!(@connection_args)
+    end
 
-        requests = drivers.map do |driver|
-          Request.prepare(statement).tap { |request| driver.submit(request) }
-        end
+    def dispatch_prepare(statement)
+      drivers = @drivers.select(&:available?)
+      if drivers.empty?
+        raise NotDispatchedError, "no live pipeline connections; statement was not prepared"
+      end
 
-        first_error = nil
-        requests.each do |request|
-          begin
-            RequestOps.clear_result(request.wait)
-          rescue StandardError => e
-            if first_error
-              e.clear_result! if e.respond_to?(:clear_result!)
-            else
-              first_error = e
-            end
+      drivers.map { |driver| Request.prepare(statement).tap { |r| driver.submit(r) } }
+    end
+
+    def await_prepares!(requests)
+      first_error = nil
+      requests.each do |request|
+        begin
+          RequestOps.clear_result(request.wait)
+        rescue StandardError => e
+          if first_error
+            e.clear_result! if e.respond_to?(:clear_result!)
+          else
+            first_error = e
           end
         end
-        raise first_error if first_error
-
-        statement
-      rescue Exception
-        if @prepared_statements.delete(logical_name)
-          @prepared_generation += 1
-        end
-        raise
-      ensure
-        requests.each { |request| request.cancel! unless request.settled? }
       end
+      raise first_error if first_error
+    end
+
+    def drop_prepared_statement(logical_name, statement)
+      return unless @prepared_statements.delete(logical_name)
+
+      @type_maps.unregister(statement.physical_name) if statement&.typed? && @type_maps
+      @prepared_generation += 1
     end
 
     def with_pinned
@@ -174,31 +207,11 @@ module PgPipeline
       raise Error, "pinned pool is disabled (pinned_size=0)" if @pinned_size.zero?
 
       owner = Fiber.current
-      if @pinned_owners[owner].positive?
-        raise RecursiveCheckoutError,
-              "nested Client#session/transaction on the same fiber is not allowed; " \
-              "use Transaction#savepoint for nested atomicity"
-      end
+      assert_not_nested_pinned!(owner)
 
       @pinned_gate.acquire do
-        raise @pinned_error if @pinned_error
-        raise ShutdownError, "pool is closing" if @closing
-
-        conn = nil
-        @pinned_active += 1
-        @pinned_owners[owner] += 1
-
-        begin
-          conn = @pinned_free.pop || PoolOps.new_connection(@connection_args)
-          raise @pinned_error if @pinned_error
-          raise ShutdownError, "pool is closing" if @closing
-
-          @pinned_in_use[conn] = owner
-          yield conn
-        ensure
-          @pinned_in_use.delete(conn) if conn
-          release_pinned(owner, conn)
-        end
+        assert_pinned_open!
+        run_pinned(owner) { |conn| yield conn }
       end
     end
 
@@ -453,7 +466,7 @@ module PgPipeline
     def start_pipeline_driver
       conn = PoolOps.new_connection(@connection_args)
       prepare_registered_statements(conn)
-      driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight)
+      driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight, type_maps: @type_maps)
       driver.start
     rescue Exception
       PoolOps.safe_close(conn) if conn
@@ -471,10 +484,11 @@ module PgPipeline
           next if prepared.key?(statement.physical_name)
 
           result = if statement.param_types.nil?
-                     conn.prepare(statement.physical_name, statement.sql)
-                   else
-                     conn.prepare(statement.physical_name, statement.sql, statement.param_types)
-                   end
+            conn.prepare(statement.physical_name, statement.sql)
+          else
+            conn.prepare(statement.physical_name, statement.sql, statement.param_types)
+          end
+
           RequestOps.clear_result(result)
           prepared[statement.physical_name] = true
         end
@@ -483,27 +497,62 @@ module PgPipeline
       end
     end
 
-    def release_pinned(owner, conn)
-      if conn
-        if @closing
-          PoolOps.safe_close(conn)
-        else
-          recycled = recycle_pinned_connection(conn)
+    def assert_not_nested_pinned!(owner)
+      return unless @pinned_owners[owner].positive?
 
-          if recycled
-            if @closing
-              PoolOps.safe_close(recycled)
-            else
-              @pinned_free << recycled
-            end
-          end
-        end
+      raise RecursiveCheckoutError,
+            "nested Client#session/transaction on the same fiber is not allowed; " \
+            "use Transaction#savepoint for nested atomicity"
+    end
+
+    def assert_pinned_open!
+      raise @pinned_error if @pinned_error
+      raise ShutdownError, "pool is closing" if @closing
+    end
+
+    def run_pinned(owner)
+      conn = nil
+      @pinned_active += 1
+      @pinned_owners[owner] += 1
+
+      begin
+        conn = take_pinned_connection
+        assert_pinned_open!
+        @pinned_in_use[conn] = owner
+        yield conn
+      ensure
+        @pinned_in_use.delete(conn) if conn
+        release_pinned(owner, conn)
       end
+    end
+
+    def take_pinned_connection
+      @pinned_free.pop || PoolOps.new_connection(@connection_args)
+    end
+
+    def release_pinned(owner, conn)
+      return_pinned_connection(conn) if conn
     ensure
       @pinned_active -= 1
       @pinned_owners[owner] -= 1
       @pinned_owners.delete(owner) if @pinned_owners[owner].zero?
       @pinned_idle.signal if @pinned_active.zero?
+    end
+
+    def return_pinned_connection(conn)
+      if @closing
+        PoolOps.safe_close(conn)
+        return
+      end
+
+      recycled = recycle_pinned_connection(conn)
+      return unless recycled
+
+      if @closing
+        PoolOps.safe_close(recycled)
+      else
+        @pinned_free << recycled
+      end
     end
 
     def recycle_pinned_connection(conn)
@@ -602,9 +651,7 @@ module PgPipeline
 
       start = rr % size
       best = nil
-      best_index = 0
-      best_load = 0
-      offset = 0
+      best_index, best_load, offset = 0, 0, 0
 
       while offset < size
         index = start + offset

@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.3.3] - 2026-08-19
+
+Opt-in typed result decoding for multiplexed prepared statements. Default
+behaviour, Sync-per-unit, and the failure model are unchanged.
+
+### Added
+
+- `Client#prepare(..., typed: true)` — text format. The first `TUPLES_OK`
+  result builds a `TypeMapByColumn`; later dispatches reuse that map from the
+  `Request` (resolved at submit, never re-read from handle state at drain).
+  Column values arrive as typed Ruby objects (Integer, Time, BigDecimal, …)
+  instead of strings, for every PostgreSQL type ruby-pg covers in text mode.
+
+### Notes
+
+- This is an API feature, not a throughput lever. Typed columns that become
+  immediates (`int`, `bool`) drop one heap object each; the rest of the
+  per-query allocation is the control plane (`Request`, fibers, `PG::Result`).
+- `CoderMapsBundle` is built on a throwaway connection at the first
+  `prepare(..., typed: true)`, never at `Client.start` and never on a live
+  pipeline FIFO (a catalog query there desyncs Sync). Untyped `query` /
+  `prepare` do not touch type maps on the drain path.
+- A failed type-map apply is a request-local `QueryError`. `typed: true`
+  promised a typed value; the handle does not silently fall back to strings.
+- `bigdecimal` is an optional dependency of ruby-pg for `numeric` text
+  decoding (required as a gem on Ruby 3.4+). Without it, other typed columns
+  still work; `numeric` follows the registry.
+- Default path (no `typed:`): `TypeMapAllStrings`, text format, string keys.
+- Binary result format is not part of this release.
+
 ## [0.3.2] - 2026-08-17
 
 Runtime correctness. Public SQL, Sync-per-unit, failure model, and the

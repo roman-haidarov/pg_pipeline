@@ -26,7 +26,9 @@ module PgPipeline
 
     def start = ClientOps.start(self)
     def query(sql, params = RequestOps::EMPTY_PARAMS) = ClientOps.query(self, sql, params)
-    def prepare(name, sql, param_types = nil) = ClientOps.prepare(self, name, sql, param_types)
+    def prepare(name, sql, param_types = nil, typed: false)
+      ClientOps.prepare(self, name, sql, param_types, typed: typed)
+    end
     def stats = ClientOps.stats(self)
 
     def session(&block)
@@ -78,18 +80,22 @@ module PgPipeline
       end
     end
 
-    def prepare(client, name, sql, param_types)
+    def prepare(client, name, sql, param_types, typed: false)
       ensure_started!(client)
       sql = RequestOps.snapshot_sql(sql)
       SessionGuard.assert_multiplexable_normalized!(sql, mode: client.guard)
-      pool(client).__send__(:prepare_statement, client, name, sql, param_types)
+      pool(client).__send__(:prepare_statement, client, name, sql, param_types, typed: typed)
     end
 
     def query_prepared(client, statement, params)
       ensure_started!(client)
 
       wait_for_request do
-        submit_with_failover(client) { Request.prepared_query(statement, params: params) }
+        submit_with_failover(client) do
+          request = Request.prepared_query(statement, params: params)
+          pool(client).bind_type_map(request, statement) if statement.typed?
+          request
+        end
       end
     end
 

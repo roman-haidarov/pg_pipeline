@@ -110,10 +110,25 @@ RSpec.describe PgPipeline::ClientOps do
         expect(PgPipeline::SessionGuard).to receive(:assert_multiplexable_normalized!)
           .with(sql, mode: :default)
         expect(pool).to receive(:prepare_statement)
-          .with(client, "by_id", sql, [23])
+          .with(client, "by_id", sql, [23], typed: false)
           .and_return(statement)
 
         expect(described_class.prepare(client, "by_id", sql, [23])).to equal(statement)
+      end
+    end
+
+    it "forwards typed: true to the pool" do
+      Sync do
+        pool = instance_double(PgPipeline::Pool)
+        client = started_client(pool)
+        statement = instance_double(PgPipeline::PreparedStatement)
+        sql = "SELECT $1::int"
+
+        expect(pool).to receive(:prepare_statement)
+          .with(client, "by_id", sql, nil, typed: true)
+          .and_return(statement)
+
+        expect(described_class.prepare(client, "by_id", sql, nil, typed: true)).to equal(statement)
       end
     end
 
@@ -122,7 +137,12 @@ RSpec.describe PgPipeline::ClientOps do
         pool = instance_double(PgPipeline::Pool, pipeline_size: 1)
         driver = instance_double(PgPipeline::ConnectionDriver)
         client = started_client(pool)
-        statement = instance_double(PgPipeline::PreparedStatement, physical_name: "pgp_1", sql: "SELECT $1::int".freeze)
+        statement = instance_double(
+          PgPipeline::PreparedStatement,
+          physical_name: "pgp_1",
+          sql: "SELECT $1::int".freeze,
+          typed?: false
+        )
         result = Object.new
 
         allow(pool).to receive(:pipeline_driver).and_return(driver)
