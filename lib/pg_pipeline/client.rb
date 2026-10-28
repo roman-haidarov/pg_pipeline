@@ -1,19 +1,20 @@
 # frozen_string_literal: true
 
-require_relative "errors"
-require_relative "pool"
-require_relative "request"
-require_relative "prepared_statement"
-require_relative "session_guard"
-require_relative "session"
-require_relative "transaction"
+require_relative 'errors'
+require_relative 'pool'
+require_relative 'request'
+require_relative 'prepared_statement'
+require_relative 'session_guard'
+require_relative 'session'
+require_relative 'transaction'
 
 module PgPipeline
   class Client
     attr_reader :guard
 
     def initialize(connection_args = nil, guard: :default, **pool_opts)
-      @owner_thread, @scheduler = nil, nil
+      @owner_thread = nil
+      @scheduler = nil
 
       @guard = SessionGuard.normalize_mode!(guard)
       @pool = Pool.new(connection_args, **pool_opts)
@@ -26,9 +27,11 @@ module PgPipeline
 
     def start = ClientOps.start(self)
     def query(sql, params = RequestOps::EMPTY_PARAMS) = ClientOps.query(self, sql, params)
+
     def prepare(name, sql, param_types = nil, typed: false)
       ClientOps.prepare(self, name, sql, param_types, typed: typed)
     end
+
     def stats = ClientOps.stats(self)
 
     def session(&block)
@@ -44,9 +47,8 @@ module PgPipeline
 
     private
 
-    attr_reader :pool, :owner_thread, :scheduler
-    attr_accessor :started
-    attr_writer :owner_thread, :scheduler
+    attr_accessor :owner_thread, :scheduler, :started
+    attr_reader :pool
   end
 
   module ClientOps
@@ -56,16 +58,18 @@ module PgPipeline
       client = Client.new(connection_args, **opts).start
       yield client
     ensure
-      client.close if client
+      client&.close
     end
 
     def start(client)
-      raise Error, "client already started" if started?(client)
-      raise Error, "client start requires an active Fiber scheduler" unless Fiber.scheduler
+      raise Error, 'client already started' if started?(client)
+
+      scheduler = Fiber.scheduler
+      raise Error, 'client start requires an active Fiber scheduler' unless scheduler
 
       pool(client).start
       client.__send__(:owner_thread=, Thread.current)
-      client.__send__(:scheduler=, Fiber.scheduler)
+      client.__send__(:scheduler=, scheduler)
       client.__send__(:started=, true)
       client
     end
@@ -108,26 +112,38 @@ module PgPipeline
 
     def submit_with_failover(client)
       attempts = 0
-      limit = [pool(client).pipeline_size, 1].max
+      client_pool = pool(client)
+      limit = [client_pool.pipeline_size, 1].max
       last_error = nil
 
       while attempts < limit
         request = yield
-        begin
-          pool(client).__send__(:pipeline_driver).submit(request)
-          return request
-        rescue NotDispatchedError => e
-          last_error = e
-          attempts += 1
-        rescue ShutdownError => e
-          last_error = e
-          attempts += 1
-          break unless request.state == :new && !request.settled?
-        end
+        last_error = submit_attempt(client_pool, request)
+        return request unless last_error
+
+        attempts += 1
+        break if stop_retrying?(request, last_error)
       end
 
-      error = last_error || NotDispatchedError.new("no live pipeline connections; request was not dispatched")
-      raise(error.is_a?(NotDispatchedError) ? error : NotDispatchedError.new(error.message))
+      raise_submission_error(last_error)
+    end
+
+    def submit_attempt(client_pool, request)
+      client_pool.__send__(:pipeline_driver).submit(request)
+      nil
+    rescue NotDispatchedError, ShutdownError => e
+      e
+    end
+
+    def stop_retrying?(request, error)
+      error.is_a?(ShutdownError) && (request.state != :new || request.settled?)
+    end
+
+    def raise_submission_error(error)
+      error ||= NotDispatchedError.new('no live pipeline connections; request was not dispatched')
+      raise error if error.is_a?(NotDispatchedError)
+
+      raise NotDispatchedError, error.message
     end
 
     def session(client)
@@ -143,13 +159,13 @@ module PgPipeline
       end
     end
 
-    def transaction(client)
+    def transaction(client, &block)
       ensure_started!(client)
 
       pool(client).__send__(:with_pinned) do |conn|
         tx = Transaction.new(conn)
         begin
-          TransactionOps.run(tx) { |transaction| yield transaction }
+          TransactionOps.run(tx, &block)
         ensure
           SessionOps.close!(tx)
         end
@@ -165,10 +181,11 @@ module PgPipeline
       return unless started?(client)
 
       ensure_context!(client)
+      client_pool = pool(client)
       begin
-        pool(client).graceful_close
+        client_pool.graceful_close
       ensure
-        client.__send__(:started=, false) if pool(client).closing?
+        client.__send__(:started=, false) if client_pool.closing?
       end
     end
 
@@ -176,10 +193,11 @@ module PgPipeline
       return unless started?(client)
 
       ensure_context!(client)
+      client_pool = pool(client)
       begin
-        pool(client).abort!
+        client_pool.abort!
       ensure
-        client.__send__(:started=, false) if pool(client).closing?
+        client.__send__(:started=, false) if client_pool.closing?
       end
     end
 
@@ -188,7 +206,7 @@ module PgPipeline
     end
 
     def ensure_started!(client)
-      raise Error, "client not started; call #start or use Client.open" unless started?(client)
+      raise Error, 'client not started; call #start or use Client.open' unless started?(client)
 
       ensure_context!(client)
     end
@@ -197,7 +215,7 @@ module PgPipeline
       return if Thread.current.equal?(client.__send__(:owner_thread)) &&
                 Fiber.scheduler.equal?(client.__send__(:scheduler))
 
-      raise Error, "client is reactor-local and cannot be used from another thread/scheduler"
+      raise Error, 'client is reactor-local and cannot be used from another thread/scheduler'
     end
 
     def started?(client)

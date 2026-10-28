@@ -28,7 +28,8 @@ module PgPipeline
       end
 
       def signal_all
-        pending, @waiters = @waiters, []
+        pending = @waiters
+        @waiters = []
         pending.each { |waiter| Runtime.wake_dequeued(waiter, self) }
         nil
       end

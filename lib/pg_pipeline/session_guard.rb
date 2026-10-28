@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "errors"
+require_relative 'errors'
 
 module PgPipeline
   module SessionGuard
@@ -9,27 +9,27 @@ module PgPipeline
     VALID_MODES = %i[default strict].freeze
     ALLOWED_LEADING = %w[select insert update delete merge values with].freeze
     FORBIDDEN_PATTERNS = {
-      "set_config" => /\bset_config\s*\(/i,
-      "setseed" => /\bsetseed\s*\(/i,
-      "currval" => /\bcurrval\s*\(/i,
-      "lastval" => /\blastval\s*\(/i,
-      "session-advisory-lock" => /\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\(/i,
-      "session-advisory-unlock" => /\bpg_advisory_unlock(?:_shared|_all)?\s*\(/i,
-      "select-into-temp" => /\binto\s+(?:(?:global|local)\s+)?temp(?:orary)?\b/i,
-      "select-into-pg-temp" => /\binto\s+(?:table\s+)?pg_temp(?:_\d+)?\s*\./i
+      'set_config' => /\bset_config\s*\(/i,
+      'setseed' => /\bsetseed\s*\(/i,
+      'currval' => /\bcurrval\s*\(/i,
+      'lastval' => /\blastval\s*\(/i,
+      'session-advisory-lock' => /\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\(/i,
+      'session-advisory-unlock' => /\bpg_advisory_unlock(?:_shared|_all)?\s*\(/i,
+      'select-into-temp' => /\binto\s+(?:(?:global|local)\s+)?temp(?:orary)?\b/i,
+      'select-into-pg-temp' => /\binto\s+(?:table\s+)?pg_temp(?:_\d+)?\s*\./i
     }.freeze
     STRICT_FORBIDDEN = {
-      "nextval" => /\bnextval\s*\(/i,
-      "setval" => /\bsetval\s*\(/i,
-      "setseed" => /\bsetseed\s*\(/i,
-      "set_config" => /\bset_config\s*\(/i,
-      "session-advisory-lock" => /\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\(/i,
-      "session-advisory-unlock" => /\bpg_advisory_unlock(?:_shared|_all)?\s*\(/i,
-      "pg_export_snapshot" => /\bpg_export_snapshot\s*\(/i
+      'nextval' => /\bnextval\s*\(/i,
+      'setval' => /\bsetval\s*\(/i,
+      'setseed' => /\bsetseed\s*\(/i,
+      'set_config' => /\bset_config\s*\(/i,
+      'session-advisory-lock' => /\bpg_(?:try_)?advisory_lock(?:_shared)?\s*\(/i,
+      'session-advisory-unlock' => /\bpg_advisory_unlock(?:_shared|_all)?\s*\(/i,
+      'pg_export_snapshot' => /\bpg_export_snapshot\s*\(/i
     }.freeze
     PATTERN_PREFILTER = /\binto\b/i
     DOLLAR_QUOTE_TAG = /\A\$(?:(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_]|[^\x00-\x7F])*)?\$/
-    NEEDS_MASK = /['"]|--|\/\*|\$(?:(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_]|[^\x00-\x7F])*)?\$/
+    NEEDS_MASK = %r{['"]|--|/\*|\$(?:(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_]|[^\x00-\x7F])*)?\$}
     LEADING_KEYWORD = /\A\s*([a-zA-Z_]+)/
     WHITESPACE_BYTES = [9, 10, 11, 12, 13, 32].freeze
 
@@ -43,7 +43,7 @@ module PgPipeline
 
       raise UnsafeMultiplexError,
             "refusing to multiplex SQL (#{reason}); the shared path only accepts " \
-            "session-neutral operations. Use Client#session for session work or " \
+            'session-neutral operations. Use Client#session for session work or ' \
             "Client#transaction for an explicit transaction.\n" \
             "  offending SQL: #{sql.to_s.strip[0, 160]}"
     end
@@ -75,20 +75,29 @@ module PgPipeline
       code = NEEDS_MASK.match?(sql) ? code_only(sql) : sql
       lead = code[LEADING_KEYWORD, 1]&.downcase
 
-      return "empty" unless lead
+      return 'empty' unless lead
       return "leading:#{lead}" unless ALLOWED_LEADING.include?(lead)
-      return "multiple-statements" if multiple_statements?(code)
-      return nil unless code.include?("(") || code.match?(PATTERN_PREFILTER)
+      return 'multiple-statements' if multiple_statements?(code)
+      return nil unless code.include?('(') || code.match?(PATTERN_PREFILTER)
 
-      FORBIDDEN_PATTERNS.each do |name, pattern|
+      forbidden_reason(code) || strict_forbidden_reason(code, mode)
+    end
+
+    def forbidden_reason(code)
+      pattern_reason(code, FORBIDDEN_PATTERNS)
+    end
+
+    def strict_forbidden_reason(code, mode)
+      return unless mode == :strict
+
+      reason = pattern_reason(code, STRICT_FORBIDDEN)
+      "strict:#{reason}" if reason
+    end
+
+    def pattern_reason(code, patterns)
+      patterns.each do |name, pattern|
         return name if code.match?(pattern)
       end
-      if mode == :strict
-        STRICT_FORBIDDEN.each do |name, pattern|
-          return "strict:#{name}" if code.match?(pattern)
-        end
-      end
-
       nil
     end
 
@@ -96,7 +105,7 @@ module PgPipeline
       normalized = mode.respond_to?(:to_sym) ? mode.to_sym : mode
       return normalized if VALID_MODES.include?(normalized)
 
-      raise ArgumentError, "guard must be one of: #{VALID_MODES.map(&:inspect).join(", ")}"
+      raise ArgumentError, "guard must be one of: #{VALID_MODES.map(&:inspect).join(', ')}"
     end
 
     def code_only(sql)
@@ -104,43 +113,19 @@ module PgPipeline
       size = source.bytesize
       output = String.new(capacity: size, encoding: Encoding::BINARY)
       index = 0
-      block_depth = 0
 
       while index < size
         byte = source.getbyte(index)
-        nxt = index + 1 < size ? source.getbyte(index + 1) : nil
-        if block_depth.positive?
-          if byte == 47 && nxt == 42
-            block_depth += 1
-            output << "  "
-            index += 2
-          elsif byte == 42 && nxt == 47
-            block_depth -= 1
-            output << "  "
-            index += 2
-          else
-            output << (byte == 10 ? 10 : 32)
-            index += 1
-          end
-          next
-        end
+        next_index = index + 1
+        nxt = next_index < size ? source.getbyte(next_index) : nil
 
         if byte == 45 && nxt == 45
-          newline = source.index("\n", index + 2)
-          if newline
-            output << (" " * (newline - index)) << "\n"
-            index = newline + 1
-          else
-            output << (" " * (size - index))
-            break
-          end
+          index = mask_line_comment(source, output, index)
           next
         end
 
         if byte == 47 && nxt == 42
-          block_depth = 1
-          output << "  "
-          index += 2
+          index = mask_block_comment(source, output, index)
           next
         end
 
@@ -155,12 +140,8 @@ module PgPipeline
         end
 
         if byte == 36
-          remainder = source.byteslice(index, size - index)
-          tag = DOLLAR_QUOTE_TAG.match(remainder)&.[](0)
-          if tag
-            closing = source.index(tag, index + tag.bytesize)
-            finish = closing ? closing + tag.bytesize : size
-            output << (" " * (finish - index))
+          finish = mask_dollar_quote(source, output, index, size)
+          if finish
             index = finish
             next
           end
@@ -173,29 +154,79 @@ module PgPipeline
       output
     end
 
+    def mask_line_comment(source, output, index)
+      newline = source.index("\n", index + 2)
+      if newline
+        output << (' ' * (newline - index)) << "\n"
+        newline + 1
+      else
+        output << (' ' * (source.bytesize - index))
+        source.bytesize
+      end
+    end
+
+    def mask_block_comment(source, output, index)
+      depth = 1
+      index = append_comment_delimiter(output, index)
+
+      while index < source.bytesize
+        byte = source.getbyte(index)
+        nxt = source.getbyte(index + 1)
+        if byte == 47 && nxt == 42
+          depth += 1
+          index = append_comment_delimiter(output, index)
+        elsif byte == 42 && nxt == 47
+          depth -= 1
+          index = append_comment_delimiter(output, index)
+          break if depth.zero?
+        else
+          output << (byte == 10 ? 10 : 32)
+          index += 1
+        end
+      end
+
+      index
+    end
+
+    def append_comment_delimiter(output, index)
+      output << '  '
+      index + 2
+    end
+
+    def mask_dollar_quote(source, output, index, size)
+      remainder = source.byteslice(index, size - index)
+      tag = DOLLAR_QUOTE_TAG.match(remainder)&.[](0)
+      return unless tag
+
+      closing = source.index(tag, index + tag.bytesize)
+      finish = closing ? closing + tag.bytesize : size
+      output << (' ' * (finish - index))
+      finish
+    end
+
     def mask_quoted(source, output, index, quote_byte, escape_backslash:)
-      output << " "
+      output << ' '
       index += 1
 
       while index < source.bytesize
         byte = source.getbyte(index)
         if escape_backslash && byte == 92
-          output << " "
+          output << ' '
           index += 1
           if index < source.bytesize
-            output << (source.getbyte(index) == 10 ? "\n" : " ")
+            output << (source.getbyte(index) == 10 ? "\n" : ' ')
             index += 1
           end
         elsif byte == quote_byte
           if source.getbyte(index + 1) == quote_byte
-            output << "  "
+            output << '  '
             index += 2
           else
-            output << " "
+            output << ' '
             return index + 1
           end
         else
-          output << (byte == 10 ? "\n" : " ")
+          output << (byte == 10 ? "\n" : ' ')
           index += 1
         end
       end
@@ -207,15 +238,19 @@ module PgPipeline
       return false if quote_index.zero?
 
       marker = source.getbyte(quote_index - 1)
-      return false unless marker == 69 || marker == 101
+      return false unless [69, 101].include?(marker)
 
       before = quote_index >= 2 ? source.getbyte(quote_index - 2) : nil
-      before.nil? || !(before.between?(48, 57) || before.between?(65, 90) || before.between?(97, 122) || before == 95)
+      !sql_identifier_byte?(before)
     end
-    private_class_method :escape_string_prefix?
+
+    def sql_identifier_byte?(byte)
+      byte && (byte.between?(48, 57) || byte.between?(65, 90) || byte.between?(97, 122) || byte == 95)
+    end
+    private_class_method :escape_string_prefix?, :sql_identifier_byte?
 
     def multiple_statements?(code)
-      first = code.index(";")
+      first = code.index(';')
       return false unless first
 
       index = first + 1

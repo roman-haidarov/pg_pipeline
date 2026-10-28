@@ -1,15 +1,63 @@
 # frozen_string_literal: true
 
-require "pg"
+require 'pg'
 
-require_relative "errors"
-require_relative "runtime"
-require_relative "connection_driver"
-require_relative "prepared_statement"
-require_relative "type_maps"
-require_relative "server_caps"
+require_relative 'errors'
+require_relative 'runtime'
+require_relative 'connection_driver'
+require_relative 'prepared_statement'
+require_relative 'type_maps'
+require_relative 'server_caps'
 
 module PgPipeline
+  PoolSettings = Data.define(
+    :pipeline_size, :pinned_size, :max_pending, :max_in_flight, :reconnect,
+    :reconnect_interval, :reconnect_backoff_max, :health_check, :health_interval,
+    :health_timeout, :cancel_pinned_on_abort
+  ) do
+    def self.build(options)
+      unknown = options.keys - members
+      raise ArgumentError, "unknown keyword: #{unknown.first}" unless unknown.empty?
+
+      new(**normalize_settings(defaults.merge(options)))
+    end
+
+    def self.defaults
+      {
+        pipeline_size: Pool::DEFAULT_PIPELINE_SIZE,
+        pinned_size: Pool::DEFAULT_PINNED_SIZE,
+        max_pending: ConnectionDriver::DEFAULT_MAX_PENDING,
+        max_in_flight: ConnectionDriver::DEFAULT_MAX_IN_FLIGHT,
+        reconnect: true,
+        reconnect_interval: Pool::DEFAULT_RECONNECT_INTERVAL,
+        reconnect_backoff_max: Pool::DEFAULT_RECONNECT_BACKOFF_MAX,
+        health_check: true,
+        health_interval: Pool::DEFAULT_HEALTH_INTERVAL,
+        health_timeout: Pool::DEFAULT_HEALTH_TIMEOUT,
+        cancel_pinned_on_abort: true
+      }
+    end
+
+    def self.normalize_settings(values)
+      {
+        pipeline_size: PoolOps.positive_integer!(values.fetch(:pipeline_size), :pipeline_size),
+        pinned_size: PoolOps.nonnegative_integer!(values.fetch(:pinned_size), :pinned_size),
+        max_pending: values.fetch(:max_pending),
+        max_in_flight: values.fetch(:max_in_flight),
+        reconnect: values.fetch(:reconnect),
+        reconnect_interval: PoolOps.finite_float!(values.fetch(:reconnect_interval), :reconnect_interval),
+        reconnect_backoff_max: PoolOps.finite_float!(values.fetch(:reconnect_backoff_max), :reconnect_backoff_max),
+        health_check: values.fetch(:health_check),
+        health_interval: PoolOps.finite_float!(values.fetch(:health_interval), :health_interval, allow_zero: true),
+        health_timeout: PoolOps.finite_float!(values.fetch(:health_timeout), :health_timeout),
+        cancel_pinned_on_abort: values.fetch(:cancel_pinned_on_abort)
+      }
+    end
+
+    private_class_method :defaults, :normalize_settings
+  end
+  private_constant :PoolSettings
+
   class Pool
     DEFAULT_PIPELINE_SIZE = 4
     DEFAULT_PINNED_SIZE = 2
@@ -24,30 +72,20 @@ module PgPipeline
 
     attr_reader :reconnects, :pipeline_size
 
-    def initialize(connection_args,
-                   pipeline_size: DEFAULT_PIPELINE_SIZE,
-                   pinned_size: DEFAULT_PINNED_SIZE,
-                   max_pending: ConnectionDriver::DEFAULT_MAX_PENDING,
-                   max_in_flight: ConnectionDriver::DEFAULT_MAX_IN_FLIGHT,
-                   reconnect: true,
-                   reconnect_interval: DEFAULT_RECONNECT_INTERVAL,
-                   reconnect_backoff_max: DEFAULT_RECONNECT_BACKOFF_MAX,
-                   health_check: true,
-                   health_interval: DEFAULT_HEALTH_INTERVAL,
-                   health_timeout: DEFAULT_HEALTH_TIMEOUT,
-                   cancel_pinned_on_abort: true)
+    def initialize(connection_args, **options)
       @connection_args = connection_args
-      @pipeline_size = PoolOps.positive_integer!(pipeline_size, :pipeline_size)
-      @pinned_size = PoolOps.nonnegative_integer!(pinned_size, :pinned_size)
-      @max_pending = max_pending
-      @max_in_flight = max_in_flight
-      @reconnect = reconnect
-      @reconnect_interval = PoolOps.finite_float!(reconnect_interval, :reconnect_interval)
-      @reconnect_backoff_max = PoolOps.finite_float!(reconnect_backoff_max, :reconnect_backoff_max)
-      @health_check = health_check
-      @health_interval = PoolOps.finite_float!(health_interval, :health_interval, allow_zero: true)
-      @health_timeout = PoolOps.finite_float!(health_timeout, :health_timeout)
-      @cancel_pinned_on_abort = cancel_pinned_on_abort
+      settings = PoolSettings.build(options)
+      @pipeline_size = settings.pipeline_size
+      @pinned_size = settings.pinned_size
+      @max_pending = settings.max_pending
+      @max_in_flight = settings.max_in_flight
+      @reconnect = settings.reconnect
+      @reconnect_interval = settings.reconnect_interval
+      @reconnect_backoff_max = settings.reconnect_backoff_max
+      @health_check = settings.health_check
+      @health_interval = settings.health_interval
+      @health_timeout = settings.health_timeout
+      @cancel_pinned_on_abort = settings.cancel_pinned_on_abort
 
       @drivers = []
       @driver_backoff = []
@@ -81,20 +119,10 @@ module PgPipeline
     end
 
     def start
-      raise Error, "pool already started" if @started
-      if @closing || @closed
-        raise ShutdownError, "pool is closing or was closed and cannot be restarted; create a new Pool"
-      end
-      raise Error, "pool start requires an active Fiber scheduler" unless Fiber.scheduler
+      validate_start!
 
       begin
-        @pipeline_size.times { @drivers << start_pipeline_driver }
-        @driver_backoff = Array.new(@drivers.size, 0.0)
-        @driver_attempts = Array.new(@drivers.size, 0)
-        @driver_last_health = Array.new(@drivers.size, monotonic)
-        @pinned_gate = Runtime::Semaphore.new(@pinned_size) if @pinned_size.positive?
-        @started = true
-        @supervisor = Runtime.spawn(name: :supervisor) { supervise } if @reconnect || @health_check
+        start_runtime
       rescue Exception
         cleanup_partial_start
         raise
@@ -103,6 +131,35 @@ module PgPipeline
       self
     end
 
+    private
+
+    def validate_start!
+      raise Error, 'pool already started' if @started
+      if @closing || @closed
+        raise ShutdownError,
+              'pool is closing or was closed and cannot be restarted; create a new Pool'
+      end
+      raise Error, 'pool start requires an active Fiber scheduler' unless Fiber.scheduler
+    end
+
+    def start_runtime
+      @pipeline_size.times { @drivers << start_pipeline_driver }
+      driver_count = @drivers.size
+      @driver_backoff = Array.new(driver_count, 0.0)
+      @driver_attempts = Array.new(driver_count, 0)
+      @driver_last_health = Array.new(driver_count, monotonic)
+      pinned_size = @pinned_size
+      @pinned_gate = Runtime::Semaphore.new(pinned_size) if pinned_size.positive?
+      @started = true
+      start_supervisor if @reconnect || @health_check
+    end
+
+    def start_supervisor
+      @supervisor = Runtime.spawn(name: :supervisor) { supervise }
+    end
+
+    public
+
     def closing? = @closing
 
     def pipeline_driver
@@ -110,7 +167,7 @@ module PgPipeline
 
       driver = PoolOps.select_driver_into(@drivers, @rr, @rr_slot)
       @rr = @rr_slot[0]
-      raise NotDispatchedError, "no live pipeline connections; request was not dispatched" unless driver
+      raise NotDispatchedError, 'no live pipeline connections; request was not dispatched' unless driver
 
       driver
     end
@@ -171,9 +228,7 @@ module PgPipeline
 
     def dispatch_prepare(statement)
       drivers = @drivers.select(&:available?)
-      if drivers.empty?
-        raise NotDispatchedError, "no live pipeline connections; statement was not prepared"
-      end
+      raise NotDispatchedError, 'no live pipeline connections; statement was not prepared' if drivers.empty?
 
       drivers.map { |driver| Request.prepare(statement).tap { |r| driver.submit(r) } }
     end
@@ -181,14 +236,12 @@ module PgPipeline
     def await_prepares!(requests)
       first_error = nil
       requests.each do |request|
-        begin
-          RequestOps.clear_result(request.wait)
-        rescue StandardError => e
-          if first_error
-            e.clear_result! if e.respond_to?(:clear_result!)
-          else
-            first_error = e
-          end
+        RequestOps.clear_result(request.wait)
+      rescue StandardError => e
+        if first_error
+          e.clear_result! if e.respond_to?(:clear_result!)
+        else
+          first_error = e
         end
       end
       raise first_error if first_error
@@ -201,17 +254,17 @@ module PgPipeline
       @prepared_generation += 1
     end
 
-    def with_pinned
+    def with_pinned(&block)
       ensure_available!
       raise @pinned_error if @pinned_error
-      raise Error, "pinned pool is disabled (pinned_size=0)" if @pinned_size.zero?
+      raise Error, 'pinned pool is disabled (pinned_size=0)' if @pinned_size.zero?
 
       owner = Fiber.current
       assert_not_nested_pinned!(owner)
 
       @pinned_gate.acquire do
         assert_pinned_open!
-        run_pinned(owner) { |conn| yield conn }
+        run_pinned(owner, &block)
       end
     end
 
@@ -243,7 +296,7 @@ module PgPipeline
       return unless @started
 
       if @pinned_owners[Fiber.current].positive?
-        raise Error, "cannot close the pool from inside Client#session/transaction"
+        raise Error, 'cannot close the pool from inside Client#session/transaction'
       end
 
       @closing = true
@@ -278,9 +331,7 @@ module PgPipeline
 
       begin
         first_error = preferred_shutdown_error(first_error, stop_supervisor)
-        if @cancel_pinned_on_abort
-          first_error = preferred_shutdown_error(first_error, cancel_in_use_pinned)
-        end
+        first_error = preferred_shutdown_error(first_error, cancel_in_use_pinned) if @cancel_pinned_on_abort
         first_error = preferred_shutdown_error(first_error, close_all_drivers(:abort!))
       ensure
         close_free_pinned
@@ -317,7 +368,7 @@ module PgPipeline
       @supervisor_error = e
       @pause_failures = (@pause_failures || 0) + 1
 
-      unless ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+      unless ENV['PG_PIPELINE_SILENCE_WARNINGS']
         warn("pg_pipeline: supervisor pause failed (#{e.class}: #{e.message}) " \
              "[#{@pause_failures}/#{MAX_PAUSE_FAILURES}]")
       end
@@ -331,11 +382,13 @@ module PgPipeline
     end
 
     def supervisor_sleep_interval
+      reconnect_interval = @reconnect_interval
+      health_interval = @health_interval
       candidates = []
-      candidates << @reconnect_interval if @reconnect
-      candidates << @health_interval if @health_check && @health_interval.positive?
-      interval = candidates.min || @reconnect_interval
-      interval.positive? ? interval : @reconnect_interval
+      candidates << reconnect_interval if @reconnect
+      candidates << health_interval if @health_check && health_interval.positive?
+      interval = candidates.min || reconnect_interval
+      interval.positive? ? interval : reconnect_interval
     end
 
     def reap_and_replace
@@ -343,22 +396,33 @@ module PgPipeline
       ensure_driver_slots!
 
       @drivers.each_index do |index|
-        driver = @drivers[index]
-        next if driver.available?
-        next unless driver.dead?
-        next if now < (@driver_backoff[index] || 0.0)
-
-        begin
-          @drivers[index] = start_pipeline_driver
-          @driver_backoff[index] = 0.0
-          @driver_attempts[index] = 0
-          @driver_last_health[index] = monotonic
-          @reconnects += 1
-        rescue StandardError
-          @driver_attempts[index] = (@driver_attempts[index] || 0) + 1
-          @driver_backoff[index] = now + next_backoff(@driver_attempts[index])
-        end
+        replace_unavailable_driver(index, now)
       end
+    end
+
+    def replace_unavailable_driver(index, now)
+      driver = @drivers[index]
+      return if driver.available? || !driver.dead? || now < (@driver_backoff[index] || 0.0)
+
+      begin
+        @drivers[index] = start_pipeline_driver
+        reset_driver_retry_state(index)
+      rescue StandardError
+        backoff_driver_retry(index, now)
+      end
+    end
+
+    def reset_driver_retry_state(index)
+      @driver_backoff[index] = 0.0
+      @driver_attempts[index] = 0
+      @driver_last_health[index] = monotonic
+      @reconnects += 1
+    end
+
+    def backoff_driver_retry(index, now)
+      attempts = (@driver_attempts[index] || 0) + 1
+      @driver_attempts[index] = attempts
+      @driver_backoff[index] = now + next_backoff(attempts)
     end
 
     def health_probe
@@ -366,23 +430,27 @@ module PgPipeline
       ensure_driver_slots!
 
       @drivers.each_index do |index|
-        driver = @drivers[index]
-        next unless driver.available?
-        next unless driver.load.zero?
-        next if now - (@driver_last_health[index] || 0.0) < @health_interval
-
-        @driver_last_health[index] = now
-
-        begin
-          next if driver.health_check(@health_timeout)
-
-          @health_failures += 1
-          driver.abort!
-        rescue StandardError => e
-          @health_failures += 1
-          @supervisor_error = e
-        end
+        probe_driver_health(index, now)
       end
+    end
+
+    def probe_driver_health(index, now)
+      driver = @drivers[index]
+      return unless driver.available? && driver.load.zero?
+      return if now - (@driver_last_health[index] || 0.0) < @health_interval
+
+      @driver_last_health[index] = now
+      run_driver_health_check(driver)
+    end
+
+    def run_driver_health_check(driver)
+      return if driver.health_check(@health_timeout)
+
+      @health_failures += 1
+      driver.abort!
+    rescue StandardError => e
+      @health_failures += 1
+      @supervisor_error = e
     end
 
     def ensure_driver_slots!
@@ -395,13 +463,14 @@ module PgPipeline
     def next_backoff(attempts)
       exponent = [Integer(attempts) - 1, 0].max
       delay = @reconnect_interval * (2.0**exponent)
-      delay.finite? && delay < @reconnect_backoff_max ? delay : @reconnect_backoff_max
+      maximum = @reconnect_backoff_max
+      delay.finite? && delay < maximum ? delay : maximum
     end
 
     def cancel_in_use_pinned
       cancellation = nil
 
-      @pinned_in_use.keys.each do |conn|
+      @pinned_in_use.each_key do |conn|
         conn.cancel if conn.respond_to?(:cancel)
       rescue CANCEL_SIGNAL => e
         cancellation ||= e
@@ -422,7 +491,7 @@ module PgPipeline
       begin
         supervisor.wait(SUPERVISOR_JOIN_TIMEOUT)
       rescue Runtime::TimeoutError
-        unless ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+        unless ENV['PG_PIPELINE_SILENCE_WARNINGS']
           warn("pg_pipeline: supervisor did not exit within #{SUPERVISOR_JOIN_TIMEOUT}s and has been leaked")
         end
       rescue CANCEL_SIGNAL, StandardError
@@ -439,13 +508,11 @@ module PgPipeline
       cancellation = nil
 
       @drivers.each do |driver|
-        begin
-          driver.public_send(method_name)
-        rescue CANCEL_SIGNAL => e
-          cancellation ||= e
-        rescue StandardError => e
-          first_error ||= e
-        end
+        driver.public_send(method_name)
+      rescue CANCEL_SIGNAL => e
+        cancellation ||= e
+      rescue StandardError => e
+        first_error ||= e
       end
 
       cancellation || first_error
@@ -459,14 +526,15 @@ module PgPipeline
     end
 
     def ensure_available!
-      raise ShutdownError, "pool is closing or closed" if @closing || @closed
-      raise Error, "pool not started" unless @started
+      raise ShutdownError, 'pool is closing or closed' if @closing || @closed
+      raise Error, 'pool not started' unless @started
     end
 
     def start_pipeline_driver
       conn = PoolOps.new_connection(@connection_args)
       prepare_registered_statements(conn)
-      driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight, type_maps: @type_maps)
+      driver = ConnectionDriver.new(conn, max_pending: @max_pending, max_in_flight: @max_in_flight,
+                                          type_maps: @type_maps)
       driver.start
     rescue Exception
       PoolOps.safe_close(conn) if conn
@@ -479,35 +547,42 @@ module PgPipeline
       loop do
         generation = @prepared_generation || 0
         statements = (@prepared_statements || {}).values.dup
-
-        statements.each do |statement|
-          next if prepared.key?(statement.physical_name)
-
-          result = if statement.param_types.nil?
-            conn.prepare(statement.physical_name, statement.sql)
-          else
-            conn.prepare(statement.physical_name, statement.sql, statement.param_types)
-          end
-
-          RequestOps.clear_result(result)
-          prepared[statement.physical_name] = true
-        end
+        prepare_statements(conn, statements, prepared)
 
         break if generation == (@prepared_generation || 0)
       end
+    end
+
+    def prepare_statements(conn, statements, prepared)
+      statements.each do |statement|
+        prepare_statement_on_connection(conn, statement, prepared) unless prepared.key?(statement.physical_name)
+      end
+    end
+
+    def prepare_statement_on_connection(conn, statement, prepared)
+      param_types = statement.param_types
+      name = statement.physical_name
+      sql = statement.sql
+      result = if param_types.nil?
+                 conn.prepare(name, sql)
+               else
+                 conn.prepare(name, sql, param_types)
+               end
+      RequestOps.clear_result(result)
+      prepared[name] = true
     end
 
     def assert_not_nested_pinned!(owner)
       return unless @pinned_owners[owner].positive?
 
       raise RecursiveCheckoutError,
-            "nested Client#session/transaction on the same fiber is not allowed; " \
-            "use Transaction#savepoint for nested atomicity"
+            'nested Client#session/transaction on the same fiber is not allowed; ' \
+            'use Transaction#savepoint for nested atomicity'
     end
 
     def assert_pinned_open!
       raise @pinned_error if @pinned_error
-      raise ShutdownError, "pool is closing" if @closing
+      raise ShutdownError, 'pool is closing' if @closing
     end
 
     def run_pinned(owner)
@@ -534,8 +609,9 @@ module PgPipeline
       return_pinned_connection(conn) if conn
     ensure
       @pinned_active -= 1
-      @pinned_owners[owner] -= 1
-      @pinned_owners.delete(owner) if @pinned_owners[owner].zero?
+      owner_count = @pinned_owners[owner] - 1
+      @pinned_owners[owner] = owner_count
+      @pinned_owners.delete(owner) if owner_count.zero?
       @pinned_idle.signal if @pinned_active.zero?
     end
 
@@ -556,28 +632,28 @@ module PgPipeline
     end
 
     def recycle_pinned_connection(conn)
-      if conn.server_version < DISCARD_SEQUENCES_SERVER_VERSION
-        PoolOps.safe_close(conn)
-        return PoolOps.new_connection(@connection_args)
-      end
+      return replace_pinned_connection(conn) if conn.server_version < DISCARD_SEQUENCES_SERVER_VERSION
 
       PoolOps.sanitize_pinned_connection(conn)
       conn
     rescue CANCEL_SIGNAL
       PoolOps.safe_close(conn)
       raise
-    rescue StandardError => cleanup_error
-      PoolOps.safe_close(conn)
-
+    rescue StandardError => e
       begin
-        PoolOps.new_connection(@connection_args)
+        replace_pinned_connection(conn)
       rescue StandardError => replacement_error
         @pinned_error = ConnectionLostError.new(
-          "pinned connection reset failed (#{cleanup_error.class}: #{cleanup_error.message}) " \
+          "pinned connection reset failed (#{e.class}: #{e.message}) " \
           "and replacement failed (#{replacement_error.class}: #{replacement_error.message})"
         )
         nil
       end
+    end
+
+    def replace_pinned_connection(conn)
+      PoolOps.safe_close(conn)
+      PoolOps.new_connection(@connection_args)
     end
 
     def wait_for_pinned_idle
@@ -613,14 +689,7 @@ module PgPipeline
   module PoolOps
     module_function
 
-    def positive_integer!(value, name)
-      integer = Integer(value)
-      raise ArgumentError, "#{name} must be >= 1" if integer < 1
-
-      integer
-    rescue ArgumentError, TypeError
-      raise ArgumentError, "#{name} must be an integer >= 1"
-    end
+    def positive_integer!(value, name) = DriverOps.positive_integer!(value, name)
 
     def finite_float!(value, name, allow_zero: false)
       number = Float(value)
@@ -629,7 +698,7 @@ module PgPipeline
 
       number
     rescue ArgumentError, TypeError
-      requirement = allow_zero ? "non-negative finite" : "positive finite"
+      requirement = allow_zero ? 'non-negative finite' : 'positive finite'
       raise ArgumentError, "#{name} must be a #{requirement} number (got #{value.inspect})"
     end
 
@@ -642,16 +711,18 @@ module PgPipeline
       raise ArgumentError, "#{name} must be an integer >= 0"
     end
 
-    def select_driver_into(drivers, rr, slot)
+    def select_driver_into(drivers, round_robin, slot)
       size = drivers.length
       if size.zero?
-        slot[0] = rr
+        slot[0] = round_robin
         return nil
       end
 
-      start = rr % size
+      start = round_robin % size
       best = nil
-      best_index, best_load, offset = 0, 0, 0
+      best_index = 0
+      best_load = 0
+      offset = 0
 
       while offset < size
         index = start + offset
@@ -668,13 +739,13 @@ module PgPipeline
         best_load = load
       end
 
-      slot[0] = best ? (best_index + 1) % size : rr
+      slot[0] = best ? (best_index + 1) % size : round_robin
       best
     end
 
-    def select_driver(drivers, rr)
-      slot = [rr]
-      driver = select_driver_into(drivers, rr, slot)
+    def select_driver(drivers, round_robin)
+      slot = [round_robin]
+      driver = select_driver_into(drivers, round_robin, slot)
       [driver, slot[0]]
     end
 
@@ -683,20 +754,21 @@ module PgPipeline
     end
 
     def sanitize_pinned_connection(conn)
-      raise ConnectionLostError, "pinned connection is closed" if conn.finished?
-      raise ConnectionLostError, "pinned connection is bad" unless conn.status == PG::CONNECTION_OK
+      raise ConnectionLostError, 'pinned connection is closed' if conn.finished?
+      raise ConnectionLostError, 'pinned connection is bad' unless conn.status == PG::CONNECTION_OK
 
-      case conn.transaction_status
+      transaction_status = conn.transaction_status
+      case transaction_status
       when PG::PQTRANS_IDLE
         nil
       when PG::PQTRANS_INTRANS, PG::PQTRANS_INERROR
-        conn.exec("ROLLBACK")
+        conn.exec('ROLLBACK')
       else
         raise ConnectionLostError,
-              "pinned connection returned in unsafe transaction state #{conn.transaction_status}"
+              "pinned connection returned in unsafe transaction state #{transaction_status}"
       end
 
-      conn.exec("DISCARD ALL")
+      conn.exec('DISCARD ALL')
       true
     end
 

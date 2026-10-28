@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-require_relative "errors"
-require_relative "request"
+require_relative 'errors'
+require_relative 'request'
 
 module PgPipeline
   class PreparedStatement
@@ -23,7 +23,7 @@ module PgPipeline
     alias call query
 
     def inspect
-      flag = @typed ? " typed" : ""
+      flag = @typed ? ' typed' : ''
       "#<#{self.class} name=#{@name.inspect} sql=#{@sql.inspect}#{flag}>"
     end
 
@@ -41,8 +41,8 @@ module PgPipeline
 
     def snapshot_name(name)
       value = name.to_s
-      raise ArgumentError, "prepared statement name must not be empty" if value.empty?
-      raise ArgumentError, "prepared statement name must not contain NUL" if value.include?("\0")
+      raise ArgumentError, 'prepared statement name must not be empty' if value.empty?
+      raise ArgumentError, 'prepared statement name must not contain NUL' if value.include?("\0")
 
       value.frozen? ? value : value.dup.freeze
     end

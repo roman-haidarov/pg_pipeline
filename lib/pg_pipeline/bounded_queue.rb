@@ -1,17 +1,19 @@
 # frozen_string_literal: true
 
-require_relative "errors"
-require_relative "runtime"
+require_relative 'errors'
+require_relative 'runtime'
 
 module PgPipeline
   class BoundedQueue
     def initialize(limit)
       @limit = Integer(limit)
-      raise ArgumentError, "limit must be >= 1" if @limit < 1
+      raise ArgumentError, 'limit must be >= 1' if @limit < 1
     rescue ArgumentError, TypeError
-      raise ArgumentError, "limit must be an integer >= 1"
+      raise ArgumentError, 'limit must be an integer >= 1'
     else
-      @items, @consumers, @producers = [], [], []
+      @items = []
+      @consumers = []
+      @producers = []
 
       @closed = false
       @close_error = nil
@@ -93,7 +95,7 @@ module PgPipeline
     end
 
     def raise_close_error
-      error = @close_error || ShutdownError.new("queue closed")
+      error = @close_error || ShutdownError.new('queue closed')
       raise error.class, error.message
     end
   end
