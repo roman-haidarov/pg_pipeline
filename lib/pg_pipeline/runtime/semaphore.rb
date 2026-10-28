@@ -5,7 +5,7 @@ module PgPipeline
     class Semaphore
       def initialize(limit)
         @limit = Integer(limit)
-        raise ArgumentError, "limit must be >= 0" if @limit.negative?
+        raise ArgumentError, 'limit must be >= 0' if @limit.negative?
 
         @available = @limit
         @waiting = WaitList.new
@@ -71,7 +71,7 @@ module PgPipeline
         def empty? = @head.nil?
 
         def push(node)
-          raise ArgumentError, "node already queued" if node.list
+          raise ArgumentError, 'node already queued' if node.list
 
           node.list = self
           node.prev = @tail
@@ -108,7 +108,7 @@ module PgPipeline
           @list = @prev = @next = nil
           @granted = false
           @scheduler = Fiber.scheduler
-          @waiter = {fiber: fiber, scheduler: @scheduler, ready: false, blocker: blocker, queued: true}
+          @waiter = { fiber: fiber, scheduler: @scheduler, ready: false, blocker: blocker, queued: true }
         end
 
         def granted? = @granted

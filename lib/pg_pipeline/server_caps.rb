@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
-require "pg"
+require 'pg'
 
-require_relative "errors"
+require_relative 'errors'
 
 module PgPipeline
   class ServerCaps
@@ -59,7 +59,7 @@ module PgPipeline
       return true if supported?(caps)
 
       raise UnsupportedServerError,
-            "pg_pipeline requires libpq >= 14, PostgreSQL protocol v3, and " \
+            'pg_pipeline requires libpq >= 14, PostgreSQL protocol v3, and ' \
             "ruby-pg pipeline bindings; libpq=#{caps.libpq_version}, " \
             "protocol=#{caps.protocol_version}, pipeline_api=#{caps.pipeline_api}"
     end

@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "errors"
+require_relative 'errors'
 
 module PgPipeline
   class Session
@@ -30,10 +30,10 @@ module PgPipeline
 
     def ensure_active!(session)
       conn = connection(session)
-      raise Error, "session handle is no longer active" unless session.active? && conn
+      raise Error, 'session handle is no longer active' unless session.active? && conn
       return if Fiber.current.equal?(session.owner_fiber)
 
-      raise Error, "session handle is fiber-local and cannot be used from another fiber"
+      raise Error, 'session handle is fiber-local and cannot be used from another fiber'
     end
 
     def query(session, sql, params)
@@ -43,19 +43,21 @@ module PgPipeline
 
     def exec(session, sql, params = nil)
       ensure_active!(session)
+      conn = connection(session)
       if params.nil?
-        connection(session).exec(sql)
+        conn.exec(sql)
       else
-        connection(session).exec_params(sql, params)
+        conn.exec_params(sql, params)
       end
     end
 
     def prepare(session, name, sql, param_types)
       ensure_active!(session)
+      conn = connection(session)
       if param_types
-        connection(session).prepare(name, sql, param_types)
+        conn.prepare(name, sql, param_types)
       else
-        connection(session).prepare(name, sql)
+        conn.prepare(name, sql)
       end
     end
 

@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
-require "timeout"
+require 'timeout'
 
-require_relative "errors"
+require_relative 'errors'
 
 module PgPipeline
   module Runtime
@@ -14,7 +14,7 @@ module PgPipeline
 
     CURRENT_TASK_KEY = :pg_pipeline_current_task
     WAITER_KEY = :pg_pipeline_waiter
-    DEADLINE_MESSAGE = "execution expired"
+    DEADLINE_MESSAGE = 'execution expired'
 
     MISSING_TIMEOUT_HOOK_WARNING = <<~MESSAGE
       pg_pipeline: %s does not implement #timeout_after.
@@ -32,7 +32,7 @@ module PgPipeline
     end
 
     def scheduler!
-      Fiber.scheduler or raise Error, "operation requires an active Fiber scheduler"
+      Fiber.scheduler or raise Error, 'operation requires an active Fiber scheduler'
     end
 
     def native_timeouts?(target = Fiber.scheduler)
@@ -48,9 +48,10 @@ module PgPipeline
         fiber: nil, scheduler: nil, ready: false, blocker: nil
       }
 
-      if waiter[:blocker]
-        raise Error, "waiter already parked on #{waiter[:blocker].class}; " \
-                     "a fiber may only park in one place at a time"
+      current_blocker = waiter[:blocker]
+      if current_blocker
+        raise Error, "waiter already parked on #{current_blocker.class}; " \
+                     'a fiber may only park in one place at a time'
       end
 
       waiter[:fiber] = Fiber.current
@@ -116,19 +117,19 @@ module PgPipeline
       return nil if timeout.nil?
 
       seconds = Float(timeout)
-      raise ArgumentError, "timeout must be non-negative and finite" unless seconds.finite? && seconds >= 0
+      raise ArgumentError, 'timeout must be non-negative and finite' unless seconds.finite? && seconds >= 0
 
       monotonic_now + seconds
     end
 
-    def with_timeout(duration)
+    def with_timeout(duration, &block)
       return yield if duration.nil?
 
       seconds = Float(duration)
-      raise ArgumentError, "timeout must be non-negative and finite" unless seconds.finite? && seconds >= 0
+      raise ArgumentError, 'timeout must be non-negative and finite' unless seconds.finite? && seconds >= 0
 
       begin
-        arm_deadline(seconds) { yield }
+        arm_deadline(seconds, &block)
       rescue Deadline => e
         raise TimeoutError, e.message
       end
@@ -136,9 +137,7 @@ module PgPipeline
 
     def arm_deadline(seconds, &block)
       target = Fiber.scheduler
-      if native_timeouts?(target)
-        return target.timeout_after(seconds, Deadline, DEADLINE_MESSAGE, &block)
-      end
+      return target.timeout_after(seconds, Deadline, DEADLINE_MESSAGE, &block) if native_timeouts?(target)
 
       warn_missing_timeout_hook(target) if target
       ::Timeout.timeout(seconds, Deadline, DEADLINE_MESSAGE, &block)
@@ -154,7 +153,7 @@ module PgPipeline
   end
 end
 
-require_relative "runtime/notification"
-require_relative "runtime/queue"
-require_relative "runtime/semaphore"
-require_relative "runtime/task"
+require_relative 'runtime/notification'
+require_relative 'runtime/queue'
+require_relative 'runtime/semaphore'
+require_relative 'runtime/task'

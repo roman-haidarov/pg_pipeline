@@ -6,7 +6,7 @@ module PgPipeline
       attr_reader :fiber, :name, :error
 
       def self.spawn(name: nil, &block)
-        raise ArgumentError, "block required" unless block
+        raise ArgumentError, 'block required' unless block
 
         task = new(name: name)
         task.__send__(:start, &block)
@@ -14,8 +14,13 @@ module PgPipeline
       end
 
       def initialize(name: nil)
-        @fiber, @scheduler, @blocker, @result, @error = nil, nil, nil, nil, nil
-        @done, @cancelled = false, false
+        @fiber = nil
+        @scheduler = nil
+        @blocker = nil
+        @result = nil
+        @error = nil
+        @done = false
+        @cancelled = false
 
         @name = name
         @waiters = []
@@ -24,7 +29,7 @@ module PgPipeline
       def wait(timeout = nil)
         unless @done
           deadline = Runtime.deadline_for(timeout)
-          raise TimeoutError, "task did not finish in time" unless join(deadline)
+          raise TimeoutError, 'task did not finish in time' unless join(deadline)
         end
         raise @error if @error
 
@@ -45,7 +50,7 @@ module PgPipeline
       def cancelled? = @cancelled
 
       def raise_if_cancelled!
-        raise Cancel, "task stopped" if @cancelled
+        raise Cancel, 'task stopped' if @cancelled
       end
 
       def enter_block(waiter)
@@ -68,7 +73,7 @@ module PgPipeline
           this.__send__(:adopt_fiber, Fiber.current)
           Thread.current[Runtime::CURRENT_TASK_KEY] = this
           begin
-            this.__send__(:complete, block.call, nil)
+            this.__send__(:complete, yield, nil)
           rescue Cancel
             this.__send__(:complete, nil, nil)
           rescue Exception => e
@@ -89,7 +94,7 @@ module PgPipeline
         return false unless fiber&.alive?
         return false unless scheduler&.respond_to?(:fiber_interrupt)
 
-        result = scheduler.fiber_interrupt(fiber, Cancel.new("task stopped"))
+        result = scheduler.fiber_interrupt(fiber, Cancel.new('task stopped'))
         result != false
       rescue FiberError
         false
@@ -119,7 +124,8 @@ module PgPipeline
       end
 
       def wake_waiters
-        pending, @waiters = @waiters, []
+        pending = @waiters
+        @waiters = []
         pending.each { |waiter| Runtime.wake_dequeued(waiter, self) }
       end
     end

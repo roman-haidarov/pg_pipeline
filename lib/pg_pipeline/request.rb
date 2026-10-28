@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "errors"
+require_relative 'errors'
 
 module PgPipeline
   class Request
@@ -119,7 +119,7 @@ module PgPipeline
 
     def snapshot_params(params)
       return EMPTY_PARAMS if params.nil?
-      raise ArgumentError, "params must be an Array" unless params.is_a?(Array)
+      raise ArgumentError, 'params must be an Array' unless params.is_a?(Array)
       return EMPTY_PARAMS if params.empty?
 
       return params if params.frozen? && immutable_values?(params)
@@ -160,24 +160,23 @@ module PgPipeline
 
     def snapshot_name(name)
       value = name.to_s
-      raise ArgumentError, "statement_name must not be empty" if value.empty?
+      raise ArgumentError, 'statement_name must not be empty' if value.empty?
 
       value.frozen? ? value : value.dup.freeze
     end
 
     def snapshot_param_types(param_types)
       return nil if param_types.nil?
-      raise ArgumentError, "param_types must be an Array or nil" unless param_types.is_a?(Array)
+      raise ArgumentError, 'param_types must be an Array or nil' unless param_types.is_a?(Array)
 
       param_types.map { |oid| oid.nil? ? nil : Integer(oid) }.freeze
     rescue ArgumentError, TypeError
-      raise ArgumentError, "param_types must contain only integer OIDs or nil"
+      raise ArgumentError, 'param_types must contain only integer OIDs or nil'
     end
 
     def transition!(req, from, to)
-      unless req.state == from
-        raise ProtocolError, "invalid request transition #{req.state.inspect} -> #{to.inspect}"
-      end
+      state = req.state
+      raise ProtocolError, "invalid request transition #{state.inspect} -> #{to.inspect}" unless state == from
 
       req.state = to
     end
@@ -205,14 +204,14 @@ module PgPipeline
     end
 
     def query_boundary!(req)
-      raise ProtocolError, "query boundary before query result" unless req.result_seen
-      raise ProtocolError, "duplicate query boundary" if req.query_boundary_seen
+      raise ProtocolError, 'query boundary before query result' unless req.result_seen
+      raise ProtocolError, 'duplicate query boundary' if req.query_boundary_seen
 
       req.query_boundary_seen = true
     end
 
     def finish!(req)
-      raise ProtocolError, "sync arrived before query boundary" unless req.query_boundary_seen
+      raise ProtocolError, 'sync arrived before query boundary' unless req.query_boundary_seen
       return if req.settled
 
       req.settled = true
@@ -237,21 +236,23 @@ module PgPipeline
       req.cancelled = true
       clear_result(req.result)
       req.result = nil
-      req.error.clear_result! if req.error.respond_to?(:clear_result!)
+      error = req.error
+      error.clear_result! if error.respond_to?(:clear_result!)
     end
 
     def wait(req)
       park_waiter(req) unless req.settled
-      raise req.error if req.error
+      error = req.error
+      raise error if error
 
       req.result
     end
 
     def park_waiter(req)
-      raise ProtocolError, "request already has a waiter" if req.waiter
+      raise ProtocolError, 'request already has a waiter' if req.waiter
 
       scheduler = Fiber.scheduler
-      raise Error, "request wait requires an active Fiber scheduler" unless scheduler
+      raise Error, 'request wait requires an active Fiber scheduler' unless scheduler
 
       waiter = Fiber.current
       req.waiter = waiter
@@ -276,8 +277,8 @@ module PgPipeline
     end
 
     def assert_result_slot!(req)
-      raise ProtocolError, "result arrived after query boundary" if req.query_boundary_seen
-      raise ProtocolError, "multiple results for one pipeline unit" if req.result_seen
+      raise ProtocolError, 'result arrived after query boundary' if req.query_boundary_seen
+      raise ProtocolError, 'multiple results for one pipeline unit' if req.result_seen
     end
 
     def clear_result(result)

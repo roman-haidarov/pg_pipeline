@@ -1,12 +1,12 @@
 # frozen_string_literal: true
 
-require "pg"
+require 'pg'
 
-require_relative "errors"
-require_relative "runtime"
-require_relative "bounded_queue"
-require_relative "server_caps"
-require_relative "request"
+require_relative 'errors'
+require_relative 'runtime'
+require_relative 'bounded_queue'
+require_relative 'server_caps'
+require_relative 'request'
 
 module PgPipeline
   class ConnectionDriver
@@ -47,7 +47,7 @@ module PgPipeline
 
       @accepting = @running = @draining = @needs_flush = @writer_armed = @request_event_pending = false
       @readable_events = @results_read = @units_completed = @flush_calls =
-        @flush_incomplete = @dispatches = @leaked_watchers = @submitting = 0
+                                           @flush_incomplete = @dispatches = @leaked_watchers = @submitting = 0
       @socket = @owner_task = @reader_task = @writer_task = @dispatching = nil
       @inflight = []
     end
@@ -66,7 +66,14 @@ module PgPipeline
         in_flight: @inflight.size,
         submitting: @submitting,
         needs_flush: @needs_flush,
-        fast_sync: @caps.fast_sync?,
+        fast_sync: @caps.fast_sync?
+      }.merge(counter_stats)
+    end
+
+    private
+
+    def counter_stats
+      {
         readable_events: readable_events,
         results_read: results_read,
         units_completed: units_completed,
@@ -80,10 +87,12 @@ module PgPipeline
       }
     end
 
+    public
+
     def health_check(timeout)
       return true unless available?
 
-      probe = Request.build("SELECT 1", nil)
+      probe = Request.build('SELECT 1', nil)
       submit(probe)
       Runtime.with_timeout(timeout) { probe.wait }
       true
@@ -101,17 +110,17 @@ module PgPipeline
 
     def graceful_close = DriverOps.graceful_close(self)
 
-    def abort!(error = ConnectionLostError.new("connection aborted"))
+    def abort!(error = ConnectionLostError.new('connection aborted'))
       DriverOps.abort!(self, error)
     end
   end
 
   module DriverOps
+    module_function
+
     WATCHER_JOIN_TIMEOUT = 2.0
     OWNER_JOIN_TIMEOUT = 5.0
     WATCHER_POLL_INTERVAL = 0.25
-
-    module_function
 
     def ratio(numerator, denominator)
       return 0.0 if denominator.zero?
@@ -122,14 +131,14 @@ module PgPipeline
     def warn_flush_coupling_once(caps)
       return if @flush_coupling_warned
       return if caps.fast_sync?
-      return if ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+      return if ENV['PG_PIPELINE_SILENCE_WARNINGS']
 
       @flush_coupling_warned = true
       warn(
         "pg_pipeline: libpq #{caps.libpq_version} couples pipeline Sync with flush " \
-        "(no PQsendPipelineSync). Queries still pipeline and still amortise RTT, but " \
-        "one flush per unit caps local throughput; libpq >= 17 is recommended for " \
-        "maximum throughput. Set PG_PIPELINE_SILENCE_WARNINGS=1 to silence this."
+        '(no PQsendPipelineSync). Queries still pipeline and still amortise RTT, but ' \
+        'one flush per unit caps local throughput; libpq >= 17 is recommended for ' \
+        'maximum throughput. Set PG_PIPELINE_SILENCE_WARNINGS=1 to silence this.'
       )
     end
 
@@ -142,299 +151,366 @@ module PgPipeline
       raise ArgumentError, "#{name} must be an integer >= 1"
     end
 
-    def start(d)
-      raise Error, "driver already started" if d.running
-      raise Error, "driver start requires an active Fiber scheduler" unless Fiber.scheduler
+    def start(driver)
+      raise Error, 'driver already started' if driver.running
+      raise Error, 'driver start requires an active Fiber scheduler' unless Fiber.scheduler
 
-      d.conn.setnonblocking(true)
-      d.conn.enter_pipeline_mode
-      d.socket = d.conn.socket_io
-      d.accepting = true
-      d.running = true
-
-      d.reader_task = Runtime.spawn(name: :reader) { reader_watcher(d) }
-      d.writer_task = Runtime.spawn(name: :writer) { writer_watcher(d) }
-      d.owner_task = Runtime.spawn(name: :owner) { owner_loop(d) }
-      d
+      conn = driver.conn
+      conn.setnonblocking(true)
+      conn.enter_pipeline_mode
+      driver.socket = conn.socket_io
+      driver.accepting = true
+      driver.running = true
+      start_tasks(driver)
+      driver
     rescue Exception
-      d.accepting = false
-      d.running = false
-      teardown_watchers(d)
-      join_owner(d)
+      driver.accepting = false
+      driver.running = false
+      teardown_watchers(driver)
+      join_owner(driver)
       raise
     end
 
-    def submit(d, request)
-      raise ShutdownError, "driver is not accepting work" unless d.accepting
-      raise ProtocolError, "request must be new before submit" unless request.state == :new
+    def start_tasks(driver)
+      driver.reader_task = Runtime.spawn(name: :reader) { reader_watcher(driver) }
+      driver.writer_task = Runtime.spawn(name: :writer) { writer_watcher(driver) }
+      driver.owner_task = Runtime.spawn(name: :owner) { owner_loop(driver) }
+    end
 
-      d.submitting += 1
+    def submit(driver, request)
+      raise ShutdownError, 'driver is not accepting work' unless driver.accepting
+      raise ProtocolError, 'request must be new before submit' unless request.state == :new
+
+      driver.submitting += 1
       begin
-        d.requests.enqueue(request)
+        driver.requests.enqueue(request)
         request.queued!
-        notify_requests(d)
+        notify_requests(driver)
       ensure
-        d.submitting -= 1
-        d.events.enqueue(:submission_finished) if d.draining && d.running && d.submitting.zero?
+        finish_submission(driver)
       end
 
       request
     end
 
-    def graceful_close(d)
-      return unless d.running
+    def finish_submission(driver)
+      submitting = driver.submitting - 1
+      driver.submitting = submitting
+      return unless driver.draining && driver.running && submitting.zero?
 
-      d.accepting = false
-      d.requests.close(ShutdownError.new("driver is closing"))
-      d.events.enqueue(:close)
-      join_owner(d)
+      driver.events.enqueue(:submission_finished)
+    end
+
+    def graceful_close(driver)
+      return unless driver.running
+
+      driver.accepting = false
+      driver.requests.close(ShutdownError.new('driver is closing'))
+      driver.events.enqueue(:close)
+      join_owner(driver)
       nil
     end
 
-    def abort!(d, error)
-      return unless d.running
+    def abort!(driver, error)
+      return unless driver.running
 
-      d.accepting = false
-      d.requests.close(not_dispatched_error(error))
-      d.events.enqueue([:abort, error])
-      join_owner(d)
+      driver.accepting = false
+      driver.requests.close(not_dispatched_error(error))
+      driver.events.enqueue([:abort, error])
+      join_owner(driver)
       nil
     end
 
-    def abort_timed_out_health_probe(d, probe)
-      return true if probe.settled? || !d.running
-      return true unless exclusive_health_probe?(d, probe)
+    def abort_timed_out_health_probe(driver, probe)
+      return true if probe.settled? || !driver.running
+      return true unless exclusive_health_probe?(driver, probe)
 
-      abort!(d, ConnectionLostError.new("idle health check timed out"))
+      abort!(driver, ConnectionLostError.new('idle health check timed out'))
       false
     end
 
-    def exclusive_health_probe?(d, probe)
-      d.accepting &&
-        d.dispatching.nil? &&
-        d.submitting.zero? &&
-        d.requests.empty? &&
-        d.inflight.length == 1 &&
-        d.inflight.first.equal?(probe)
+    def exclusive_health_probe?(driver, probe)
+      inflight = driver.inflight
+      driver.accepting &&
+        driver.dispatching.nil? &&
+        driver.submitting.zero? &&
+        driver.requests.empty? &&
+        inflight.length == 1 &&
+        inflight.first.equal?(probe)
     end
 
-    def owner_loop(d)
-      while d.running
-        event = d.events.dequeue
+    def owner_loop(driver)
+      while driver.running
+        event = driver.events.dequeue
         break if event.nil?
 
-        process_event(d, event)
+        process_event(driver, event)
       end
     rescue StandardError => e
-      fatal_close(d, ConnectionLostError.new("driver crashed: #{e.class}: #{e.message}"))
+      fatal_close(driver, ConnectionLostError.new("driver crashed: #{e.class}: #{e.message}"))
     ensure
-      fatal_close(d, ShutdownError.new("driver owner stopped before shutdown completed")) if d.running
+      fatal_close(driver, ShutdownError.new('driver owner stopped before shutdown completed')) if driver.running
     end
 
-    def process_event(d, event)
-      input_changed = false
+    def process_event(driver, event)
+      input_changed = handle_event(driver, event)
+      return if input_changed == :stopped
+
+      drain_results(driver) if input_changed
+      pump_requests(driver) if driver.running
+      finish_graceful_close(driver) if driver.running && driver.draining && drained?(driver)
+    end
+
+    def handle_event(driver, event)
       case event
       when :requests
-        d.request_event_pending = false
+        driver.request_event_pending = false
       when :submission_finished
         nil
       when :readable
-        begin
-          d.readable_events += 1
-          read_available(d)
-          input_changed = true
-        ensure
-          d.reader_rearm.enqueue(:rearm) if d.running
-        end
+        handle_readable_event(driver)
+        return true
       when :writable
-        d.writer_armed = false
-        flush_output(d)
+        handle_writable_event(driver)
       when :close
-        d.draining = true
+        driver.draining = true
       when Array
         tag, payload = event
-        if tag == :abort
-          fatal_close(d, payload)
-          return
-        end
+        return abort_event(driver, tag, payload)
       end
 
-      drain_results(d) if input_changed
-      pump_requests(d) if d.running
-      finish_graceful_close(d) if d.running && d.draining && drained?(d)
+      false
     end
 
-    def notify_requests(d)
-      return if d.request_event_pending
-      return unless d.running
-
-      d.request_event_pending = true
-      d.events.enqueue(:requests)
+    def handle_writable_event(driver)
+      driver.writer_armed = false
+      flush_output(driver)
     end
 
-    def pump_requests(d)
+    def handle_readable_event(driver)
+      driver.readable_events += 1
+      read_available(driver)
+      true
+    ensure
+      driver.reader_rearm.enqueue(:rearm) if driver.running
+    end
+
+    def abort_event(driver, tag, payload)
+      return false unless tag == :abort
+
+      fatal_close(driver, payload)
+      :stopped
+    end
+
+    def notify_requests(driver)
+      return if driver.request_event_pending
+      return unless driver.running
+
+      driver.request_event_pending = true
+      driver.events.enqueue(:requests)
+    end
+
+    def pump_requests(driver)
       dispatched = false
-      while d.inflight.size < d.max_in_flight && !d.requests.empty?
-        request = d.requests.dequeue
+      while driver.inflight.size < driver.max_in_flight && !driver.requests.empty?
+        request = driver.requests.dequeue
         break unless request
         next if request.cancelled?
 
-        d.dispatching = request
-        unless send_unit(d, request)
-          d.dispatching = nil
-          next
-        end
-
-        request.dispatched!
-        d.inflight << request
-        d.dispatching = nil
-        d.dispatches += 1
-        dispatched = true
+        dispatched = dispatch_request(driver, request) || dispatched
       end
 
-      flush_output(d) if dispatched && !d.needs_flush
+      flush_output(driver) if dispatched && !driver.needs_flush
     end
 
-    def send_unit(d, request)
-      begin
-        send_command(d.conn, request)
-      rescue PG::UnableToSend => e
-        d.dispatching = nil
-        request.reject!(
-          NotDispatchedError.new("query was rejected before libpq accepted it: #{e.class}: #{e.message}")
-        )
-        return false if reusable_after_send_rejection?(d)
+    def dispatch_request(driver, request)
+      driver.dispatching = request
+      return false unless send_unit(driver, request)
 
-        raise ConnectionLostError, "dispatch failed: #{e.class}: #{e.message}"
-      rescue PG::Error => e
-        d.dispatching = nil
-        request.reject!(
-          NotDispatchedError.new("query was rejected before libpq accepted it: #{e.class}: #{e.message}")
-        )
-        raise ConnectionLostError, "dispatch failed: #{e.class}: #{e.message}"
-      rescue ProtocolError
-        raise
-      rescue StandardError => e
-        request.reject!(e)
-        return false
-      end
-
-      d.caps.place_sync(d.conn)
+      request.dispatched!
+      driver.inflight << request
+      driver.dispatching = nil
+      driver.dispatches += 1
       true
+    ensure
+      driver.dispatching = nil if request&.settled?
+    end
+
+    def send_unit(driver, request)
+      return false unless send_request(driver, request)
+
+      place_sync(driver)
+      true
+    end
+
+    def send_request(driver, request)
+      send_command(driver.conn, request)
+      true
+    rescue PG::UnableToSend => e
+      reject_send_error(driver, request, e, recoverable: reusable_after_send_rejection?(driver))
+    rescue PG::Error => e
+      reject_send_error(driver, request, e)
+    rescue ProtocolError
+      raise
+    rescue StandardError => e
+      request.reject!(e)
+      false
+    end
+
+    def place_sync(driver)
+      driver.caps.place_sync(driver.conn)
     rescue PG::Error => e
       raise ConnectionLostError, "dispatch Sync failed: #{e.class}: #{e.message}"
     end
 
+    def reject_send_error(driver, request, error, recoverable: false)
+      driver.dispatching = nil
+      request.reject!(NotDispatchedError.new("query was rejected before libpq accepted it: #{error.class}: #{error.message}"))
+      return false if recoverable
+
+      raise ConnectionLostError, "dispatch failed: #{error.class}: #{error.message}"
+    end
+
     def send_command(conn, request)
-      case request.operation
+      operation = request.operation
+      params = request.params
+      case operation
       when :query
-        conn.send_query_params(request.sql, request.params)
+        conn.send_query_params(request.sql, params)
       when :prepare
-        if request.param_types.nil?
-          conn.send_prepare(request.statement_name, request.sql)
-        else
-          conn.send_prepare(request.statement_name, request.sql, request.param_types)
-        end
+        send_prepare(conn, request)
       when :prepared_query
-        conn.send_query_prepared(request.statement_name, request.params)
+        conn.send_query_prepared(request.statement_name, params)
       else
-        raise ProtocolError, "unsupported request operation #{request.operation.inspect}"
+        raise ProtocolError, "unsupported request operation #{operation.inspect}"
       end
     end
 
-    def reusable_after_send_rejection?(d)
-      !d.conn.finished? &&
-        d.conn.status == PG::CONNECTION_OK &&
-        d.conn.pipeline_status != PG::PQ_PIPELINE_OFF
+    def send_prepare(conn, request)
+      param_types = request.param_types
+      statement_name = request.statement_name
+      sql = request.sql
+      if param_types.nil?
+        conn.send_prepare(statement_name, sql)
+      else
+        conn.send_prepare(statement_name, sql, param_types)
+      end
+    end
+
+    def reusable_after_send_rejection?(driver)
+      conn = driver.conn
+      !conn.finished? && conn.status == PG::CONNECTION_OK && conn.pipeline_status != PG::PQ_PIPELINE_OFF
     rescue PG::Error
       false
     end
 
-    def flush_output(d)
-      return unless d.running
+    def flush_output(driver)
+      return unless driver.running
 
-      d.flush_calls += 1
-      if d.conn.sync_flush
-        d.needs_flush = false
+      driver.flush_calls += 1
+      if driver.conn.sync_flush
+        driver.needs_flush = false
       else
-        d.needs_flush = true
-        d.flush_incomplete += 1
-        arm_writer(d)
+        driver.needs_flush = true
+        driver.flush_incomplete += 1
+        arm_writer(driver)
       end
     rescue PG::Error => e
       raise ConnectionLostError, "flush failed: #{e.class}: #{e.message}"
     end
 
-    def arm_writer(d)
-      return if d.writer_armed
-      return unless d.running
+    def arm_writer(driver)
+      return if driver.writer_armed
+      return unless driver.running
 
-      d.writer_armed = true
-      d.writer_commands.enqueue(:wait_writable)
+      driver.writer_armed = true
+      driver.writer_commands.enqueue(:wait_writable)
     end
 
-    def read_available(d)
-      d.conn.consume_input
+    def read_available(driver)
+      driver.conn.consume_input
     rescue PG::Error => e
       raise ConnectionLostError, "read failed: #{e.class}: #{e.message}"
     end
 
-    def drain_results(d)
+    def drain_results(driver)
       read = 0
+      conn = driver.conn
+      inflight = driver.inflight
 
       begin
-        while !d.inflight.empty? && !d.conn.is_busy
-          result = d.conn.sync_get_result
+        while !inflight.empty? && !conn.is_busy
+          result = conn.sync_get_result
           read += 1
-          request = d.inflight.first
-          raise ProtocolError, "result without an in-flight request" unless request
+          request = inflight.first
+          raise ProtocolError, 'result without an in-flight request' unless request
 
-          handle_pipeline_result(d, request, result)
+          handle_pipeline_result(driver, request, result)
         end
       ensure
-        d.results_read += read if read.positive?
+        driver.results_read += read if read.positive?
       end
     end
 
-    def handle_pipeline_result(d, request, result)
+    def handle_pipeline_result(driver, request, result)
       if result.nil?
         request.query_boundary!
         return
       end
 
-      status = result.result_status
+      handle_pipeline_status(driver, request, result, result.result_status)
+    end
+
+    def handle_pipeline_status(driver, request, result, status)
       case status
       when PG::PGRES_TUPLES_OK
-        accept_tuples_ok(d, request, result)
+        accept_tuples_ok(driver, request, result)
       when PG::PGRES_PIPELINE_SYNC
-        clear_result(result)
-        complete_front(d, request)
+        complete_pipeline_sync(driver, request, result)
       when PG::PGRES_COMMAND_OK, PG::PGRES_EMPTY_QUERY
-        ensure_before_query_boundary!(request, status)
-        request.accept_result(result)
+        accept_command_result(request, result, status)
       when PG::PGRES_FATAL_ERROR
-        ensure_before_query_boundary!(request, status)
-        request.record_error!(query_error(result), result: result)
+        record_fatal_result(request, result, status)
       when PG::PGRES_PIPELINE_ABORTED
-        ensure_before_query_boundary!(request, status)
-        clear_result(result)
-        request.record_error!(PipelineAbortedError.new("pipeline unit aborted"))
+        record_aborted_result(request, result, status)
       when PG::PGRES_BAD_RESPONSE
-        reject_pipeline_status!(result, "server response was not understood")
+        reject_pipeline_status!(result, 'server response was not understood')
       when PG::PGRES_COPY_IN, PG::PGRES_COPY_OUT, PG::PGRES_COPY_BOTH
-        reject_pipeline_status!(result, "COPY is not supported on the multiplexed pipeline")
+        reject_pipeline_status!(result, 'COPY is not supported on the multiplexed pipeline')
       else
         reject_pipeline_status!(result, "unexpected pipeline result status #{status}")
       end
     end
 
-    def accept_tuples_ok(d, request, result)
+    def complete_pipeline_sync(driver, request, result)
+      clear_result(result)
+      complete_front(driver, request)
+    end
+
+    def accept_command_result(request, result, status)
+      ensure_before_query_boundary!(request, status)
+      request.accept_result(result)
+    end
+
+    def record_fatal_result(request, result, status)
+      ensure_before_query_boundary!(request, status)
+      request.record_error!(query_error(result), result: result)
+    end
+
+    def record_aborted_result(request, result, status)
+      ensure_before_query_boundary!(request, status)
+      clear_result(result)
+      request.record_error!(PipelineAbortedError.new('pipeline unit aborted'))
+    end
+
+    def accept_tuples_ok(driver, request, result)
       ensure_before_query_boundary!(request, PG::PGRES_TUPLES_OK)
       begin
-        apply_type_map(d, request, result)
+        apply_type_map(driver, request, result)
         request.accept_result(result)
       rescue StandardError => e
-        message = e.is_a?(Error) ? e.message : "typed result mapping failed: #{e.class}: #{e.message}"
+        detail = e.message
+        message = e.is_a?(Error) ? detail : "typed result mapping failed: #{e.class}: #{detail}"
         request.record_error!(QueryError.new(message, cause_result: result), result: result)
       end
     end
@@ -450,61 +526,62 @@ module PgPipeline
       raise ProtocolError, "result status #{status} arrived after query boundary"
     end
 
-    def complete_front(d, request)
-      raise ProtocolError, "sync does not match FIFO front" unless request.equal?(d.inflight.first)
+    def complete_front(driver, request)
+      inflight = driver.inflight
+      raise ProtocolError, 'sync does not match FIFO front' unless request.equal?(inflight.first)
 
-      d.inflight.shift
-      d.units_completed += 1
+      inflight.shift
+      driver.units_completed += 1
       request.finish!
     end
 
     def query_error(result)
       message = result.error_message.to_s.strip
-      message = "query failed" if message.empty?
+      message = 'query failed' if message.empty?
       QueryError.new(message, cause_result: result)
     end
 
-    def drained?(d)
-      d.submitting.zero? && d.requests.empty? && d.inflight.empty? && !d.needs_flush && d.dispatching.nil?
+    def drained?(driver)
+      driver.submitting.zero? && driver.requests.empty? && driver.inflight.empty? && !driver.needs_flush && driver.dispatching.nil?
     end
 
-    def finish_graceful_close(d)
-      d.accepting = false
-      d.running = false
-      d.conn.exit_pipeline_mode
+    def finish_graceful_close(driver)
+      driver.accepting = false
+      driver.running = false
+      driver.conn.exit_pipeline_mode
     rescue PG::Error => e
-      fail_all(d, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
+      fail_all(driver, ConnectionLostError.new("failed to exit pipeline mode: #{e.message}"))
     ensure
-      teardown_watchers(d)
+      teardown_watchers(driver)
     end
 
-    def fatal_close(d, error)
-      return unless d.running || d.accepting
+    def fatal_close(driver, error)
+      return unless driver.running || driver.accepting
 
-      d.accepting = false
-      d.running = false
-      d.requests.close(not_dispatched_error(error))
-      fail_all(d, error)
+      driver.accepting = false
+      driver.running = false
+      driver.requests.close(not_dispatched_error(error))
+      fail_all(driver, error)
 
-      teardown_watchers(d)
+      teardown_watchers(driver)
     end
 
-    def fail_all(d, error)
+    def fail_all(driver, error)
+      dispatching = driver.dispatching
+      inflight = driver.inflight
       uncertain = []
-      uncertain << d.dispatching if d.dispatching
-      uncertain.concat(d.inflight)
-      queued = d.requests.drain
+      uncertain << dispatching if dispatching
+      uncertain.concat(inflight)
+      queued = driver.requests.drain
 
-      uncertain.compact.uniq.each do |request|
-        request.reject!(indeterminate_error(error)) unless request.settled?
-      end
+      reject_requests(uncertain.compact.uniq) { indeterminate_error(error) }
+      reject_requests(queued) { not_dispatched_error(error) }
+      driver.dispatching = nil
+      inflight.clear
+    end
 
-      queued.each do |request|
-        request.reject!(not_dispatched_error(error)) unless request.settled?
-      end
-
-      d.dispatching = nil
-      d.inflight.clear
+    def reject_requests(requests)
+      requests.each { |request| request.reject!(yield) unless request.settled? }
     end
 
     def not_dispatched_error(error)
@@ -518,7 +595,7 @@ module PgPipeline
 
       IndeterminateResultError.new(
         "#{error.message}; request was dispatched but its Sync was not observed, " \
-        "so execution/commit outcome is indeterminate"
+        'so execution/commit outcome is indeterminate'
       )
     end
 
@@ -529,76 +606,76 @@ module PgPipeline
       WATCHER_POLL_INTERVAL
     end
 
-    def wait_socket_readable(d, timeout)
+    def wait_socket_readable(driver, timeout)
       loop do
-        return false unless d.running
-        return true if d.socket.wait_readable(timeout)
+        return false unless driver.running
+        return true if driver.socket.wait_readable(timeout)
       end
     end
 
-    def wait_socket_writable(d, timeout)
+    def wait_socket_writable(driver, timeout)
       loop do
-        return false unless d.running
-        return true if d.socket.wait_writable(timeout)
+        return false unless driver.running
+        return true if driver.socket.wait_writable(timeout)
       end
     end
 
-    def reader_watcher(d)
+    def reader_watcher(driver)
       timeout = watcher_wait_timeout
 
-      while d.running
-        break unless wait_socket_readable(d, timeout)
+      while driver.running
+        break unless wait_socket_readable(driver, timeout)
 
-        d.events.enqueue(:readable)
-        command = d.reader_rearm.dequeue
-        break unless command == :rearm && d.running
+        driver.events.enqueue(:readable)
+        command = driver.reader_rearm.dequeue
+        break unless command == :rearm && driver.running
       end
     rescue StandardError => e
-      if d.running
-        d.events.enqueue([:abort, ConnectionLostError.new("reader watcher failed: #{e.class}: #{e.message}")])
+      if driver.running
+        driver.events.enqueue([:abort, ConnectionLostError.new("reader watcher failed: #{e.class}: #{e.message}")])
       end
     end
 
-    def writer_watcher(d)
+    def writer_watcher(driver)
       timeout = watcher_wait_timeout
 
-      while d.running
-        command = d.writer_commands.dequeue
-        break unless command == :wait_writable && d.running
-        break unless wait_socket_writable(d, timeout)
+      while driver.running
+        command = driver.writer_commands.dequeue
+        break unless command == :wait_writable && driver.running
+        break unless wait_socket_writable(driver, timeout)
 
-        d.events.enqueue(:writable) if d.running
+        driver.events.enqueue(:writable) if driver.running
       end
     rescue StandardError => e
-      if d.running
-        d.events.enqueue([:abort, ConnectionLostError.new("writer watcher failed: #{e.class}: #{e.message}")])
+      if driver.running
+        driver.events.enqueue([:abort, ConnectionLostError.new("writer watcher failed: #{e.class}: #{e.message}")])
       end
     end
 
-    def teardown_watchers(d)
-      tasks = release_watchers(d)
-      close_wait_points(d)
+    def teardown_watchers(driver)
+      tasks = release_watchers(driver)
+      close_wait_points(driver)
       begin
-        d.socket&.close
+        driver.socket&.close
       rescue StandardError
         nil
       end
       stop_watchers(tasks)
-      join_watchers(d, tasks)
-      d.socket = nil
-      safe_close_conn(d)
+      join_watchers(driver, tasks)
+      driver.socket = nil
+      safe_close_conn(driver)
       nil
     end
 
-    def release_watchers(d)
-      tasks = [d.reader_task, d.writer_task].compact
-      d.reader_task = nil
-      d.writer_task = nil
+    def release_watchers(driver)
+      tasks = [driver.reader_task, driver.writer_task].compact
+      driver.reader_task = nil
+      driver.writer_task = nil
       tasks
     end
 
-    def close_wait_points(d)
-      [d.reader_rearm, d.writer_commands, d.events].each do |queue|
+    def close_wait_points(driver)
+      [driver.reader_rearm, driver.writer_commands, driver.events].each do |queue|
         queue&.close
       rescue StandardError
         nil
@@ -615,12 +692,12 @@ module PgPipeline
       nil
     end
 
-    def join_watchers(d, tasks)
+    def join_watchers(driver, tasks)
       Array(tasks).each do |task|
         task.wait(WATCHER_JOIN_TIMEOUT)
       rescue Runtime::TimeoutError
-        d.leaked_watchers += 1
-        warn_leaked_task(d, task, WATCHER_JOIN_TIMEOUT)
+        driver.leaked_watchers += 1
+        warn_leaked_task(driver, task, WATCHER_JOIN_TIMEOUT)
       rescue Runtime::Cancel, StandardError
         nil
       end
@@ -628,16 +705,16 @@ module PgPipeline
       nil
     end
 
-    def join_owner(d)
-      owner = d.owner_task
+    def join_owner(driver)
+      owner = driver.owner_task
       return if owner.nil?
       return if Fiber.current.equal?(owner.fiber)
 
       begin
         owner.wait(OWNER_JOIN_TIMEOUT)
       rescue Runtime::TimeoutError
-        d.leaked_watchers += 1
-        warn_leaked_task(d, owner, OWNER_JOIN_TIMEOUT)
+        driver.leaked_watchers += 1
+        warn_leaked_task(driver, owner, OWNER_JOIN_TIMEOUT)
       rescue Runtime::Cancel, StandardError
         nil
       end
@@ -645,30 +722,30 @@ module PgPipeline
       nil
     end
 
-    def warn_leaked_task(d, task, timeout)
-      return if ENV["PG_PIPELINE_SILENCE_WARNINGS"]
+    def warn_leaked_task(driver, task, timeout)
+      return if ENV['PG_PIPELINE_SILENCE_WARNINGS']
 
       warn(
         "pg_pipeline: task #{task.name.inspect} did not exit within " \
-        "#{timeout}s and has been leaked (total #{d.leaked_watchers}). " \
-        "Closing the socket and, on schedulers without #fiber_interrupt, the " \
+        "#{timeout}s and has been leaked (total #{driver.leaked_watchers}). " \
+        'Closing the socket and, on schedulers without #fiber_interrupt, the ' \
         "#{WATCHER_POLL_INTERVAL}s watcher poll did not release the fiber in time."
       )
     end
 
-    def safe_close_conn(d)
-      d.conn.close unless d.conn.finished?
+    def safe_close_conn(driver)
+      driver.conn.close unless driver.conn.finished?
     rescue StandardError
       nil
     end
 
-    def apply_type_map(d, request, result)
+    def apply_type_map(driver, request, result)
       return unless request.type_map
 
-      maps = d.type_maps
-      raise Error, "typed statement has no type-map registry" unless maps
+      maps = driver.type_maps
+      raise Error, 'typed statement has no type-map registry' unless maps
 
-      maps.apply!(request, result, d.conn)
+      maps.apply!(request, result, driver.conn)
     end
 
     def clear_result(result)

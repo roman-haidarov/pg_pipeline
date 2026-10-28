@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.4] - 2026-10-28
+
+Internal refactoring of the control plane. No intended public API or wire
+behaviour changes.
+
+### Changed
+
+- Centralized pool option defaults and validation.
+- Split driver, pool, request, SQL-guard, and type-map operations into smaller
+  focused methods and removed redundant repeated lookups.
+
+### Fixed
+
+- Readable driver events now trigger result draining.
+
 ## [0.3.3] - 2026-08-19
 
 Opt-in typed result decoding for multiplexed prepared statements. Default
